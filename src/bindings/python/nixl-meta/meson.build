@@ -36,6 +36,9 @@ license_path = fs.copyfile(root_license_path)
 
 nixl_sources = files(
   'nixl/__init__.py',
+  'nixl/cute/_bindings.py',
+  'nixl/cute/_helpers.py',
+  'nixl/cute/_structs.py',
   'nixl/cute/__init__.py',
   'nixl/cute/device.py',
   'nixl/cute/runtime.py',

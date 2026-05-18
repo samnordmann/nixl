@@ -12,7 +12,7 @@ import torch
 
 from nixl._api import nixl_agent, nixl_agent_config
 
-from .device import is_device_api_available
+from .device import device_api_status
 
 
 def _as_agent_name(name: str | bytes) -> str:
@@ -77,12 +77,58 @@ class RemoteAgent:
 
 
 @dataclass(frozen=True)
-class PreparedView:
-    """Placeholder host-side view passed to future CuTe device wrappers."""
+class LocalView:
+    """Host-side description of a local registered tensor.
 
-    local: tuple[RegisteredTensor, ...]
-    remote: tuple[RemoteAgent, ...]
-    device_api_available: bool
+    This is not yet a device-consumable handle.  It is the Python control-plane
+    object that will eventually map to a small C ABI handle for CuTe kernels.
+    """
+
+    registration: RegisteredTensor
+    index: int
+    handle: int | None = None
+
+    @property
+    def address(self) -> int:
+        return self.registration.address
+
+    @property
+    def nbytes(self) -> int:
+        return self.registration.nbytes
+
+    @property
+    def device_id(self) -> int:
+        return self.registration.device_id
+
+
+@dataclass(frozen=True)
+class RemoteView:
+    """Host-side description of a remote NIXL agent imported from metadata."""
+
+    agent: RemoteAgent
+    index: int
+    handle: int | None = None
+
+    @property
+    def name(self) -> str:
+        return self.agent.name
+
+    @property
+    def metadata(self) -> bytes:
+        return self.agent.metadata
+
+
+@dataclass(frozen=True)
+class PreparedViews:
+    """Explicit local/remote view bundle for future CuTe device wrappers."""
+
+    local: tuple[LocalView, ...]
+    remote: tuple[RemoteView, ...]
+    device_status: object
+
+    @property
+    def device_api_available(self) -> bool:
+        return bool(getattr(self.device_status, "available", False))
 
 
 class Agent:
@@ -141,7 +187,9 @@ class Agent:
         if not regs:
             return self._agent.get_agent_metadata()
         if len(regs) != 1:
-            raise NotImplementedError("Partial metadata export currently supports one registration")
+            raise NotImplementedError(
+                "Partial metadata export currently supports one registration"
+            )
         return self._agent.get_partial_agent_metadata(
             regs[0].descs,
             inc_conn_info=include_connection_info,
@@ -153,20 +201,45 @@ class Agent:
         return RemoteAgent(name=remote_name, metadata=metadata)
 
     def remove_remote(self, remote: RemoteAgent | str) -> None:
-        self._agent.remove_remote_agent(remote.name if isinstance(remote, RemoteAgent) else remote)
+        self._agent.remove_remote_agent(
+            remote.name if isinstance(remote, RemoteAgent) else remote
+        )
 
     def make_connection(self, remote: RemoteAgent | str) -> None:
-        self._agent.make_connection(remote.name if isinstance(remote, RemoteAgent) else remote)
+        self._agent.make_connection(
+            remote.name if isinstance(remote, RemoteAgent) else remote
+        )
+
+    def prepare_views(
+        self,
+        *,
+        local: Iterable[RegisteredTensor] = (),
+        remote: Iterable[RemoteAgent] = (),
+    ) -> PreparedViews:
+        """Prepare explicit local and remote views for a future device call.
+
+        The returned views intentionally preserve NIXL's asymmetric model: local
+        registrations and remote agents remain distinct instead of being forced
+        into a symmetric window abstraction.
+        """
+
+        return PreparedViews(
+            local=tuple(
+                LocalView(registration=reg, index=i) for i, reg in enumerate(local)
+            ),
+            remote=tuple(
+                RemoteView(agent=agent, index=i) for i, agent in enumerate(remote)
+            ),
+            device_status=device_api_status(),
+        )
 
     def prepare_view(
         self,
         *,
         local: Iterable[RegisteredTensor] = (),
         remote: Iterable[RemoteAgent] = (),
-    ) -> PreparedView:
-        return PreparedView(
-            local=tuple(local),
-            remote=tuple(remote),
-            device_api_available=is_device_api_available(),
-        )
+    ) -> PreparedViews:
+        """Backward-compatible singular spelling for ``prepare_views``."""
+
+        return self.prepare_views(local=local, remote=remote)
 

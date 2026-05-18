@@ -82,7 +82,7 @@ def run(m: int, n: int) -> None:
 
     status = device_api_status()
     print("PASS: CuTe local copy")
-    print(f"NIXL device API available: {status.available} ({status.reason})")
+    print(f"NIXL CuTe device binding available: {status.available} ({status.reason})")
 
 
 def parse_args() -> argparse.Namespace:

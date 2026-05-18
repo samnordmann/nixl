@@ -17,16 +17,18 @@ def run(device: str, n: int, backends: list[str]) -> None:
 
     with agent.register_tensor(tensor) as registered:
         metadata = agent.export_metadata([registered])
-        view = agent.prepare_view(local=[registered])
+        views = agent.prepare_views(local=[registered])
         assert registered.address == tensor.data_ptr()
         assert registered.nbytes == tensor.numel() * tensor.element_size()
         assert len(metadata) > 0
-        assert len(view.local) == 1
+        assert len(views.local) == 1
+        assert views.local[0].registration is registered
+        assert views.local[0].nbytes == registered.nbytes
 
     status = device_api_status()
     print("PASS: NIXL CuTe host runtime")
     print(f"metadata bytes: {len(metadata)}")
-    print(f"NIXL device API available: {status.available} ({status.reason})")
+    print(f"NIXL CuTe device binding available: {status.available} ({status.reason})")
 
 
 def parse_args() -> argparse.Namespace:
