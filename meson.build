@@ -410,6 +410,7 @@ if get_option('install_headers')
 
   if ucx_gpu_device_api_available
     install_headers('src/api/gpu/ucx/nixl_device.cuh', install_dir: prefix_inc + '/gpu/ucx')
+    install_headers('src/api/gpu/ucx/nixl_device_wrapper.cuh', install_dir: prefix_inc + '/gpu/ucx')
   endif
 endif
 
