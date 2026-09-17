@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -112,8 +113,11 @@ public:
      */
     bool
     covers(const nixlBasicDesc &query) const noexcept {
-        return (devId == query.devId) && (addr <= query.addr) &&
-            ((addr + len) >= (query.addr + query.len));
+        if (devId != query.devId || addr > query.addr) {
+            return false;
+        }
+        const uintptr_t offset = query.addr - addr;
+        return offset <= len && query.len <= len - offset;
     }
 
     /**
@@ -172,6 +176,24 @@ struct nixlStrideDesc : public nixlBasicDesc {
         : nixlBasicDesc(addr, len, dev_id),
           stride(stride),
           count(count) {}
+
+    /**
+     * @brief Check that the run geometry can be represented without native
+     *        size_t or uintptr_t wraparound.
+     */
+    [[nodiscard]] bool
+    isValid() const noexcept {
+        if (count == 0 || len == 0 || stride < len) {
+            return false;
+        }
+        const size_t repeated = count - 1;
+        if (repeated != 0 &&
+            stride > (std::numeric_limits<size_t>::max() - len) / repeated) {
+            return false;
+        }
+        const size_t extent = repeated * stride + len;
+        return extent <= std::numeric_limits<uintptr_t>::max() - addr;
+    }
 
     /**
      * @brief Compare all nixlStrideDesc fields for equality

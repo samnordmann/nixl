@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 #include <cstring>
+#include <limits>
+#include <utility>
 
 #include "serdes.h"
 #include "common/nixl_log.h"
@@ -77,6 +79,58 @@ std::string nixlSerDes::getStr(const std::string &tag){
         NIXL_ERROR << "Deserialization of tag " << tag << " failed for empty data";
     }
     return ret;
+}
+
+nixl_status_t
+nixlSerDes::getStrChecked(const std::string &tag, std::string &str) {
+    if (des_offset < 0) {
+        NIXL_ERROR << "Deserialization of tag " << tag << " has an invalid offset";
+        return NIXL_ERR_MISMATCH;
+    }
+
+    size_t offset = static_cast<size_t>(des_offset);
+    const size_t size = workingStr.size();
+    if (offset > size || tag.size() > size - offset) {
+        NIXL_ERROR << "Deserialization of tag " << tag
+                   << " failed for incomplete or missing tag";
+        return NIXL_ERR_MISMATCH;
+    }
+    if (std::memcmp(workingStr.data() + offset, tag.data(), tag.size()) != 0) {
+        NIXL_ERROR << "Deserialization of tag " << tag << " failed for tag mismatch";
+        return NIXL_ERR_MISMATCH;
+    }
+    offset += tag.size();
+
+    if (sizeof(size_t) > size - offset) {
+        NIXL_ERROR << "Deserialization of tag " << tag << " failed for incomplete length";
+        return NIXL_ERR_MISMATCH;
+    }
+    size_t len;
+    std::memcpy(&len, workingStr.data() + offset, sizeof(len));
+    offset += sizeof(len);
+
+    // Require both the complete value and its delimiter. Subtraction-based
+    // bounds keep an attacker-controlled SIZE_MAX length from wrapping.
+    const size_t remaining = size - offset;
+    if (len >= remaining) {
+        NIXL_ERROR << "Deserialization of tag " << tag << " failed for incomplete data";
+        return NIXL_ERR_MISMATCH;
+    }
+    if (workingStr[offset + len] != '|') {
+        NIXL_ERROR << "Deserialization of tag " << tag << " failed for missing delimiter";
+        return NIXL_ERR_MISMATCH;
+    }
+
+    const size_t next_offset = offset + len + 1;
+    if (next_offset > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        NIXL_ERROR << "Deserialization of tag " << tag << " exceeded the offset range";
+        return NIXL_ERR_MISMATCH;
+    }
+
+    std::string parsed(workingStr.data() + offset, len);
+    des_offset = static_cast<ssize_t>(next_offset);
+    str = std::move(parsed);
+    return NIXL_SUCCESS;
 }
 
 // Byte buffers serialization

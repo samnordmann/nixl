@@ -17,12 +17,34 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <limits>
 #include <random>
 #include <vector>
 
 #include "mem_section.h"
 
 namespace descriptors {
+
+TEST(BasicDescRangeTest, CoversAndOverlapsDoNotWrapAtUintptrLimit) {
+    constexpr uintptr_t max = std::numeric_limits<uintptr_t>::max();
+    const nixlBasicDesc wrapping(max - 4, 8, 1);
+    const nixlBasicDesc tail(max - 2, 1, 1);
+
+    EXPECT_TRUE(wrapping.covers(tail));
+    EXPECT_TRUE(wrapping.overlaps(tail));
+    EXPECT_FALSE(wrapping.overlaps(nixlBasicDesc(0, 1, 1)));
+    EXPECT_TRUE(nixlBasicDesc(max, 1, 1).covers(nixlBasicDesc(max, 1, 1)));
+    EXPECT_TRUE(nixlBasicDesc(max, 1, 1).overlaps(nixlBasicDesc(max, 1, 1)));
+}
+
+TEST(StrideDescRangeTest, RejectsNativeExtentAndAddressOverflow) {
+    constexpr uintptr_t max = std::numeric_limits<uintptr_t>::max();
+
+    EXPECT_TRUE(nixlStrideDesc(1024, 8, 0, 16, 4).isValid());
+    EXPECT_FALSE(nixlStrideDesc(1024, 8, 0, SIZE_MAX, 3).isValid());
+    EXPECT_FALSE(nixlStrideDesc(max - 8, 8, 0, 8, 2).isValid());
+    EXPECT_FALSE(nixlStrideDesc(1024, 8, 0, 4, 2).isValid());
+}
 
 class secDescListTest : public ::testing::Test {
 protected:

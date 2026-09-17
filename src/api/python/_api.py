@@ -18,7 +18,7 @@ from __future__ import annotations
 import pickle
 import sys
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import numpy as np
 
@@ -55,12 +55,48 @@ class nixl_prepped_dlist_handle:
         value: Internal handle
     """
 
-    __slots__ = ("_handle", "_agent", "_released")
+    __slots__ = (
+        "_handle",
+        "_agent",
+        "_owner",
+        "_owner_agent",
+        "_retry_registry",
+        "_release_state",
+    )
 
-    def __init__(self, agent, value: int):
-        self._handle = int(value)
-        self._agent = agent
-        self._released = False
+    def __init__(self, agent, value):
+        self._owner_agent = agent if hasattr(agent, "agent") else None
+        self._agent = agent.agent if self._owner_agent is not None else agent
+        self._retry_registry = None
+        if hasattr(value, "value") and hasattr(value, "release"):
+            registry = getattr(self._owner_agent, "_leaked_dlist_handles", None)
+            if registry is not None:
+                # Publish durable ownership before this wrapper can ever make
+                # an interruptible native release. If construction unwinds
+                # before this append, the request has not been posted and the
+                # native owner's destructor remains sufficient.
+                registry.append(value)
+                self._retry_registry = registry
+            self._owner = value
+            self._handle = int(value.value)
+            self._release_state = None
+        else:
+            # Compatibility for callers that explicitly wrap a legacy raw
+            # binding handle. New high-level creation paths always pass a
+            # native-owned handle object instead.
+            self._owner = None
+            self._handle = int(value)
+            self._release_state = nixlBind.nixlDlistReleaseState(self._handle)
+
+    @property
+    def _released(self) -> bool:
+        if self._owner is not None:
+            return self._owner.released
+        return self._release_state.released
+
+    @property
+    def released(self) -> bool:
+        return self._released
 
     def __repr__(self) -> str:
         return (
@@ -69,14 +105,24 @@ class nixl_prepped_dlist_handle:
 
     def release(self):
         if not self._released:
-            self._agent.releasedDlistH(self._handle)
-            self._released = True
+            if self._owner is not None:
+                self._owner.release()
+            else:
+                self._agent.releasedDlistHOnce(self._release_state, self._handle)
+        if self._owner is not None and self._owner.released:
+            registry = self._retry_registry
+            if registry is not None:
+                try:
+                    registry.remove(self._owner)
+                except ValueError:
+                    pass
+                self._retry_registry = None
 
     def __del__(self):
         if not self._released:
             try:
-                self._agent.releasedDlistH(self._handle)
-            except Exception:
+                self.release()
+            except BaseException:
                 try:
                     logger.error(
                         "nixl_prepped_dlist_handle finalization failed for 0x%x",
@@ -84,6 +130,13 @@ class nixl_prepped_dlist_handle:
                     )
                 except Exception:
                     pass
+                # Binding-owned handles were placed in the retry registry at
+                # construction. Legacy raw wrappers can only publish here.
+                if self._owner is None and self._owner_agent is not None:
+                    try:
+                        self._owner_agent._leaked_dlist_handles.append(self._handle)
+                    except BaseException:
+                        pass
 
 
 class nixl_xfer_handle:
@@ -98,26 +151,67 @@ class nixl_xfer_handle:
         value: Internal handle
     """
 
-    __slots__ = ("_handle", "_agent", "_released")
+    __slots__ = (
+        "_handle",
+        "_agent",
+        "_owner",
+        "_owner_agent",
+        "_retry_registry",
+        "_release_state",
+    )
 
-    def __init__(self, agent, value: int):
-        self._handle = int(value)
-        self._agent = agent
-        self._released = False
+    def __init__(self, agent, value):
+        self._owner_agent = agent if hasattr(agent, "agent") else None
+        self._agent = agent.agent if self._owner_agent is not None else agent
+        self._retry_registry = None
+        if hasattr(value, "value") and hasattr(value, "release"):
+            registry = getattr(self._owner_agent, "_leaked_xfer_handles", None)
+            if registry is not None:
+                # Keep the native owner reachable from the agent before any
+                # active request can be finalized or interrupted.
+                registry.append(value)
+                self._retry_registry = registry
+            self._owner = value
+            self._handle = int(value.value)
+            self._release_state = None
+        else:
+            self._owner = None
+            self._handle = int(value)
+            self._release_state = nixlBind.nixlXferReleaseState(self._handle)
+
+    @property
+    def _released(self) -> bool:
+        if self._owner is not None:
+            return self._owner.released
+        return self._release_state.released
+
+    @property
+    def released(self) -> bool:
+        return self._released
 
     def __repr__(self) -> str:
         return f"nixl_xfer_handle(0x{self._handle:x}, released={self._released})"
 
     def release(self):
         if not self._released:
-            self._agent.releaseXferReq(self._handle)
-            self._released = True
+            if self._owner is not None:
+                self._owner.release()
+            else:
+                self._agent.releaseXferReqOnce(self._release_state, self._handle)
+        if self._owner is not None and self._owner.released:
+            registry = self._retry_registry
+            if registry is not None:
+                try:
+                    registry.remove(self._owner)
+                except ValueError:
+                    pass
+                self._retry_registry = None
 
     def __del__(self):
         if not self._released:
             try:
-                self._agent.releaseXferReq(self._handle)
-            except Exception:
+                self.release()
+            except BaseException:
                 try:
                     logger.error(
                         "nixl_xfer_handle finalization failed for 0x%x; keeping handle alive in agent leak list",
@@ -125,10 +219,18 @@ class nixl_xfer_handle:
                     )
                 except Exception:
                     pass
-                try:
-                    self._agent._leaked_xfer_handles.append(self._handle)
-                except Exception:
-                    pass
+                # Binding-owned handles were placed in the retry registry at
+                # construction. Legacy raw wrappers can only publish here.
+                if self._owner is None and self._owner_agent is not None:
+                    try:
+                        self._owner_agent._leaked_xfer_handles.append(self._handle)
+                    except BaseException:
+                        pass
+                elif self._owner is None:
+                    try:
+                        self._agent._leaked_xfer_handles.append(self._handle)
+                    except BaseException:
+                        pass
                 return
 
 
@@ -229,7 +331,8 @@ class nixl_agent:
         self.agent = nixlBind.nixlAgent(agent_name, agent_config)
 
         self.name = agent_name
-        self._leaked_xfer_handles: list[int] = []
+        self._leaked_xfer_handles: list[object] = []
+        self._leaked_dlist_handles: list[object] = []
         self.notifs: dict[str, list[bytes]] = {}
         self.backends: dict[str, nixl_backend_handle] = {}
         self.backend_mems: dict[str, list[str]] = {}
@@ -285,15 +388,40 @@ class nixl_agent:
         if getattr(self, "_leaked_xfer_handles", None):
             for h in list(self._leaked_xfer_handles):
                 try:
-                    self.agent.releaseXferReq(h)
-                except Exception as e:
+                    if hasattr(h, "release"):
+                        h.release()
+                    else:
+                        self.agent.releaseXferReq(h)
+                except BaseException as e:
                     try:
+                        value = h.value if hasattr(h, "value") else h
                         logger.error(
-                            "Failed to finalize leaked nixl_xfer_handle 0x%x: %s", h, e
+                            "Failed to finalize leaked nixl_xfer_handle 0x%x: %s",
+                            value,
+                            e,
                         )
                     except Exception:
                         pass
             self._leaked_xfer_handles.clear()
+        if getattr(self, "_leaked_dlist_handles", None):
+            for h in list(self._leaked_dlist_handles):
+                try:
+                    if hasattr(h, "release"):
+                        h.release()
+                    else:
+                        self.agent.releasedDlistH(h)
+                except BaseException as e:
+                    try:
+                        value = h.value if hasattr(h, "value") else h
+                        logger.error(
+                            "Failed to finalize leaked nixl_prepped_dlist_handle "
+                            "0x%x: %s",
+                            value,
+                            e,
+                        )
+                    except Exception:
+                        pass
+            self._leaked_dlist_handles.clear()
 
     def _load_plugin_params(self, plugin: str):
         if plugin not in self.plugin_list:
@@ -440,10 +568,66 @@ class nixl_agent:
             backends: Optional list of backend names for deregistration, otherwise NIXL will deregister
                 with all the backends that have these memory regions registered.
         """
-        handle_list = []
-        for backend_string in backends:
-            handle_list.append(self.backends[backend_string])
-        self.agent.deregisterMem(dereg_list, handle_list)
+        handle_list = self._durable_deregister_backend_handles(backends)
+        if handle_list is None:
+            # Generic NIXL deregistration does not expose per-backend ownership
+            # or progress. Preserve its historical behavior without claiming
+            # interruption-safe retry semantics.
+            legacy_handles = [self.backends[name] for name in backends]
+            self.agent.deregisterMem(dereg_list, legacy_handles)
+            return None
+
+        receipt = self.agent.prepareDeregisterMem(dereg_list, handle_list)
+        try:
+            self.execute_deregister_memory(receipt)
+        except nixlBind.nixlNotFoundError:
+            # A caller may have lost the successful return (for example to a
+            # pending signal) and therefore no longer own the first receipt.
+            # A fresh retry observes NOT_FOUND, whose new native receipt is
+            # already durably complete, and normalizes it to idempotent success.
+            if not receipt.completed:
+                raise
+        return None
+
+    def prepare_deregister_memory(
+        self, dereg_list: nixlBind.nixlRegDList, backends: list[str] = []
+    ):
+        """Prepare a singleton-UCX, interruption-safe deregistration receipt.
+
+        An explicit ``["UCX"]`` selection qualifies. An omitted selection is
+        inferred only when UCX is the sole configured backend. Generic, non-UCX,
+        and multi-backend native receipts are deliberately unsupported because
+        NIXL does not expose per-backend deregistration ownership and progress.
+        ``deregister_memory`` retains legacy behavior for those cases without
+        claiming interruption-safe retry.
+        """
+        handle_list = self._durable_deregister_backend_handles(backends)
+        if handle_list is None:
+            raise ValueError(
+                "a durable deregistration receipt requires exactly one "
+                "configured or explicit UCX backend"
+            )
+        return self.agent.prepareDeregisterMem(dereg_list, handle_list)
+
+    def _durable_deregister_backend_handles(
+        self, backends: Sequence[str]
+    ) -> Optional[list[int]]:
+        selected = list(backends)
+        if selected:
+            if selected != ["UCX"]:
+                return None
+        elif tuple(self.backends) != ("UCX",):
+            return None
+        return [self.backends["UCX"]]
+
+    def execute_deregister_memory(self, receipt):
+        """Execute a prepared deregistration receipt, or retry it as a no-op.
+
+        Native SUCCESS and NOT_FOUND set ``receipt.completed`` before the GIL is
+        reacquired. Callers can therefore reconcile a signal raised at binding
+        return without risking a second native deregistration.
+        """
+        return self.agent.executeDeregisterMem(receipt)
 
     def query_memory(
         self, reg_list, backend: str, mem_type: Optional[str] = None
@@ -536,13 +720,13 @@ class nixl_agent:
             if mem_type is None:
                 raise ValueError("Please specify a mem type for strided descriptors")
             # An Nx5 array carries no memory type, so it is passed separately
-            handle = self.agent.prepXferDlist(
+            handle = self.agent.prepXferDlistOwned(
                 agent_name, self.nixl_mems[mem_type], xfer_list, handle_list
             )
         else:
             descs = self.get_xfer_descs(xfer_list, mem_type)
-            handle = self.agent.prepXferDlist(agent_name, descs, handle_list)
-        return nixl_prepped_dlist_handle(self.agent, handle)
+            handle = self.agent.prepXferDlistOwned(agent_name, descs, handle_list)
+        return nixl_prepped_dlist_handle(self, handle)
 
     def estimate_xfer_cost(self, req_handle: nixl_xfer_handle) -> tuple[int, int, int]:
         """Estimate the cost of a transfer operation.
@@ -565,9 +749,9 @@ class nixl_agent:
         self,
         operation: str,
         local_xfer_side: nixl_prepped_dlist_handle,
-        local_indices: Union[list[int], np.ndarray],
+        local_indices: Union[Sequence[int], np.ndarray, memoryview],
         remote_xfer_side: nixl_prepped_dlist_handle,
-        remote_indices: Union[list[int], np.ndarray],
+        remote_indices: Union[Sequence[int], np.ndarray, memoryview],
         notif_msg: bytes = b"",
         backends: list[str] = [],
         skip_desc_merge: bool = False,
@@ -578,10 +762,12 @@ class nixl_agent:
             operation: Type of operation ("WRITE" or "READ").
             local_xfer_side: Handle to the local transfer descriptor list,
                 received from prep_xfer_dlist.
-            local_indices: List or numpy array (dtype=int32) of indices for selecting local descriptors.
+            local_indices: Sequence, NumPy array, or one-dimensional C-contiguous
+                native signed-int32 PEP 3118 buffer selecting local descriptors.
             remote_xfer_side: Handle to the remote (or loopback) transfer descriptor list,
                 received from prep_xfer_dlist.
-            remote_indices: List or numpy array (dtype=int32) of indices for selecting remote descriptors.
+            remote_indices: Sequence, NumPy array, or one-dimensional C-contiguous
+                native signed-int32 PEP 3118 buffer selecting remote descriptors.
             notif_msg: Optional notification message to send after transfer is done.
                 notif_msg should be bytes, as that is what will be returned to the target, but will work with str too.
             backends: Optional list of backend names to limit which backends NIXL can use.
@@ -596,7 +782,7 @@ class nixl_agent:
         for backend_string in backends:
             handle_list.append(self.backends[backend_string])
 
-        handle = self.agent.makeXferReq(
+        handle = self.agent.makeXferReqOwned(
             op,
             local_xfer_side._handle,
             local_indices,
@@ -607,7 +793,7 @@ class nixl_agent:
             skip_desc_merge,
         )
 
-        return nixl_xfer_handle(self.agent, handle)
+        return nixl_xfer_handle(self, handle)
 
     def initialize_xfer(
         self,
@@ -642,11 +828,11 @@ class nixl_agent:
         for backend_string in backends:
             handle_list.append(self.backends[backend_string])
 
-        handle = self.agent.createXferReq(
+        handle = self.agent.createXferReqOwned(
             op, local_descs, remote_descs, remote_agent, notif_msg, handle_list
         )
 
-        return nixl_xfer_handle(self.agent, handle)
+        return nixl_xfer_handle(self, handle)
 
     def transfer(self, handle: nixl_xfer_handle, notif_msg: bytes = b"") -> str:
         """Initiate a data transfer operation.
@@ -795,6 +981,34 @@ class nixl_agent:
             handle_list.append(self.backends[backend_string])
         return self.agent.getNotifs({}, handle_list)
 
+    def get_new_notif_batches(
+        self, backends: list[str] = []
+    ) -> dict[str, tuple[bytes, ...]]:
+        """Destructively receive new notifications grouped by native source.
+
+        Unlike :meth:`get_new_notifs`, each source value is an immutable tuple
+        and this method never accumulates into a caller-owned mapping. New
+        bindings materialize that final grouped shape directly. The fallback
+        preserves source compatibility with older bindings at one tuple copy
+        per non-empty source. This is a destructive drain, not a subscription:
+        all receive APIs on the agent compete for the same queues, and an error
+        can follow partial native consumption. Backend names are resolved only
+        through this agent, so the raw binding's handle-ownership precondition
+        cannot be violated here.
+        """
+        handle_list = []
+        for backend_string in backends:
+            handle_list.append(self.backends[backend_string])
+        grouped = getattr(self.agent, "getNotifsGrouped", None)
+        if callable(grouped):
+            return grouped(handle_list)
+        notifications = self.agent.getNotifs({}, handle_list)
+        return {
+            source: tuple(payloads)
+            for source, payloads in notifications.items()
+            if payloads
+        }
+
     def update_notifs(self, backends: list[str] = []) -> dict[str, list[bytes]]:
         """Update notifications in a map
         Same as get_new_notifs, but returns all unhandled notifications in agent.
@@ -864,7 +1078,22 @@ class nixl_agent:
         if backend is None:
             self.agent.genNotif(remote_agent_name, notif_msg)
         else:
-            self.agent.genNotif(remote_agent_name, notif_msg, self.backends[backend])
+            self.agent.genNotif(remote_agent_name, notif_msg, [self.backends[backend]])
+
+    def create_notif_sender(
+        self,
+        remote_agent_name: str,
+        backends: Optional[Sequence[str]] = None,
+    ):
+        """Prepare a sender for repeated standalone notifications.
+
+        The destination and backend handles are resolved once. ``send()``
+        returns ``None`` at NIXL local acceptance, not remote application
+        observation.
+        """
+
+        handles = [self.backends[name] for name in backends or ()]
+        return self.agent.createNotifSender(remote_agent_name, handles)
 
     def get_agent_metadata(self) -> bytes:
         """Get the full metadata of the local agent.
@@ -908,6 +1137,15 @@ class nixl_agent:
         """
         agent_name = self.agent.loadRemoteMD(metadata)
         return agent_name
+
+    def inspect_remote_agent(self, metadata: bytes) -> str:
+        """Return the agent identity in metadata without loading it.
+
+        This is intended for control planes that must authenticate or bind an
+        expected peer identity before any native connection or memory state is
+        mutated.
+        """
+        return self.agent.inspectRemoteMD(metadata).decode("utf-8")
 
     def remove_remote_agent(self, agent: str):
         """Remove a remote agent. After this call, current agent cannot initiate

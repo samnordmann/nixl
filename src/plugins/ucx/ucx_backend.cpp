@@ -49,9 +49,11 @@ sglEnabledFromConfig() {
 }
 } // namespace
 
-// A transfer to a single endpoint posts at most three requests:
-// one data request, one flush request, and one notification request.
-constexpr size_t single_ep_request_count = 3;
+// In addition to its data requests, a transfer to one endpoint can post one
+// flush and one attached-notification request. Reserving both control slots up
+// front keeps the common reusable-handle path allocation-free after its first
+// post while retaining every asynchronous UCX request until it is terminal.
+constexpr size_t per_transfer_control_request_count = 2;
 
 /****************************************
  * Backend request management
@@ -62,12 +64,22 @@ private:
     ucx_connection_ptr_t conn_;
     std::vector<nixlUcxReq> requests_;
     nixlUcxWorker *worker_ = nullptr;
+    nixl_status_t terminalStatus_ = NIXL_SUCCESS;
+    bool releaseRequested_ = false;
 
     [[nodiscard]] nixl_status_t
-    checkConnection(const nixl_status_t status = NIXL_SUCCESS) const {
-        NIXL_ASSERT(conn_ != nullptr);
-        const nixl_status_t conn_status = conn_->getEp(getWorkerId())->checkTxState();
+    checkConnection(const ucx_connection_ptr_t &conn,
+                    const nixl_status_t status = NIXL_SUCCESS) const {
+        NIXL_ASSERT(conn != nullptr);
+        const nixl_status_t conn_status = conn->getEp(getWorkerId())->checkTxState();
         return (conn_status != NIXL_SUCCESS) ? conn_status : status;
+    }
+
+    void
+    rememberTerminalStatus(const nixl_status_t status, const ucx_connection_ptr_t &conn) {
+        if (status != NIXL_SUCCESS && status != NIXL_IN_PROG && terminalStatus_ == NIXL_SUCCESS) {
+            terminalStatus_ = checkConnection(conn, status);
+        }
     }
 
 protected:
@@ -98,24 +110,40 @@ public:
         setWorker(worker);
     }
 
+    nixlUcxBackendReqH(const nixlUcxBackendReqH &) = delete;
+    nixlUcxBackendReqH &
+    operator=(const nixlUcxBackendReqH &) = delete;
+    nixlUcxBackendReqH(nixlUcxBackendReqH &&) noexcept = default;
+
+    ~nixlUcxBackendReqH() override {
+        // A request object must never outlive an asynchronous UCX operation
+        // whose completion it owns.
+        NIXL_ASSERT(requests_.empty());
+    }
+
     void
     reserve(size_t size) {
         requests_.reserve(size);
+        NIXL_ASSERT(requests_.empty());
         NIXL_ASSERT(conn_ == nullptr);
+        NIXL_ASSERT(!releaseRequested_);
+        terminalStatus_ = NIXL_SUCCESS;
     }
 
     [[nodiscard]] nixl_status_t
     append(nixl_status_t status, nixlUcxReq req, const ucx_connection_ptr_t &conn) {
         if (status == NIXL_IN_PROG) [[likely]] {
+            NIXL_ASSERT(req != nullptr);
+            NIXL_ASSERT(conn_ == nullptr || conn_ == conn);
+            conn_ = conn;
             requests_.push_back(req);
         } else if (status != NIXL_SUCCESS) {
-            // Error. Release all previously initiated ops and exit:
-            release();
+            if (conn_) {
+                NIXL_ASSERT(conn_ == conn);
+            }
+            rememberTerminalStatus(status, conn);
             return status;
         }
-
-        NIXL_ASSERT(conn_ == nullptr || conn_ == conn);
-        conn_ = conn;
         return NIXL_SUCCESS;
     }
 
@@ -124,28 +152,12 @@ public:
         return false;
     }
 
-    virtual void
-    release() {
-        // TODO: Error log: uncompleted requests found! Cancelling ...
-        for (nixlUcxReq req : requests_) {
-            const nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
-            if (ret == NIXL_IN_PROG) {
-                // TODO: Need process this properly.
-                // it may not be enough to cancel UCX request
-                worker_->reqCancel(req);
-            }
-            worker_->reqRelease(req);
-        }
-        requests_.clear();
-        conn_.reset();
-    }
-
     [[nodiscard]] virtual nixl_status_t
     status() {
         if (requests_.empty()) {
             /* No pending transmissions */
             conn_.reset();
-            return NIXL_SUCCESS;
+            return terminalStatus_;
         }
 
         worker_->progressLoop();
@@ -156,34 +168,68 @@ public:
         const nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
         if (ret == NIXL_IN_PROG) {
             return NIXL_IN_PROG;
-        } else if (ret != NIXL_SUCCESS) {
-            return checkConnection(ret);
         }
 
-        /* Last request completed successfully, all the others must be in the
-         * same state. TODO: remove extra checks? */
+        /*
+         * The last request is normally the endpoint flush. Keep that one-check
+         * incomplete fast path above. Once it is terminal, scan exactly once
+         * to release every terminal request and retain any request that still
+         * needs progress. A terminal error is reported only after the entire
+         * cohort is quiescent.
+         */
         size_t incomplete_reqs = 0;
-        nixl_status_t out_ret = NIXL_SUCCESS;
         for (nixlUcxReq req : requests_) {
             const nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
-            if (ret == NIXL_SUCCESS) [[likely]] {
-                worker_->reqRelease(req);
-            } else if (ret == NIXL_IN_PROG) {
-                if (out_ret == NIXL_SUCCESS) {
-                    out_ret = NIXL_IN_PROG;
-                }
+            if (ret == NIXL_IN_PROG) {
                 requests_[incomplete_reqs++] = req;
             } else {
-                // Any other ret value is ERR and will be returned
-                out_ret = checkConnection(ret);
+                rememberTerminalStatus(ret, conn_);
+                worker_->reqRelease(req);
             }
         }
 
         requests_.resize(incomplete_reqs);
-        if (requests_.empty()) {
-            conn_.reset();
+        if (!requests_.empty()) {
+            return NIXL_IN_PROG;
         }
-        return out_ret;
+        conn_.reset();
+        return terminalStatus_;
+    }
+
+    [[nodiscard]] virtual nixl_status_t
+    tryRelease() {
+        releaseRequested_ = true;
+        (void)status();
+        if (!requests_.empty()) {
+            return NIXL_IN_PROG;
+        }
+
+        // A notification which has not been posted owns no UCX operation and
+        // is intentionally discarded when its transfer is released.
+        notif.reset();
+        return NIXL_SUCCESS;
+    }
+
+    [[nodiscard]] bool
+    isQuiescent() const noexcept {
+        return requests_.empty();
+    }
+
+    [[nodiscard]] bool
+    releaseRequested() const noexcept {
+        return releaseRequested_;
+    }
+
+    void
+    requestCancel() {
+        // Used only while stopping a dedicated progress thread. Cancellation
+        // is asynchronous: retain every request and let status() observe a
+        // terminal state before reqRelease() is permitted.
+        for (nixlUcxReq req : requests_) {
+            if (nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req)) == NIXL_IN_PROG) {
+                worker_->reqCancel(req);
+            }
+        }
     }
 
     [[nodiscard]] nixlUcxWorker *
@@ -429,7 +475,7 @@ public:
         setWorker(worker);
     }
 
-    void
+    [[nodiscard]] std::shared_ptr<nixlUcxBackendSharedState>
     complete(nixl_status_t status);
 
     [[nodiscard]] nixl_status_t
@@ -466,26 +512,24 @@ struct nixlUcxBackendSharedState {
     }
 };
 
-void
+std::shared_ptr<nixlUcxBackendSharedState>
 nixlUcxChunkBackendReqH::complete(const nixl_status_t status) {
     NIXL_ASSERT(sharedState_.get() != nullptr);
+    NIXL_ASSERT(isQuiescent());
+    auto shared_state = std::move(sharedState_);
     if (status != NIXL_SUCCESS) {
-        nixlUcxBackendReqH::release();
-        sharedState_->status.store(status);
+        nixl_status_t expected = NIXL_SUCCESS;
+        shared_state->status.compare_exchange_strong(expected, status);
     }
-    sharedState_->pendingReqs.fetch_sub(1);
-    NIXL_TRACE << *this << " completed with status: " << status << ", " << *sharedState_;
     setWorker(nullptr);
-    sharedState_.reset();
+    return shared_state;
 }
 
 nixl_status_t
 nixlUcxChunkBackendReqH::status() {
-    // First check if entire request was cancelled or failed
-    const nixl_status_t status = sharedState_->status.load();
-    if (status != NIXL_SUCCESS) {
-        return status;
-    }
+    // A sibling chunk's error must not make this chunk look terminal. Each
+    // chunk drains its own UCX request cohort before complete() drops the
+    // shared-state ownership count.
     return nixlUcxBackendReqH::status();
 }
 
@@ -517,6 +561,10 @@ public:
     void
     startXfer() {
         NIXL_ASSERT(sharedState_->pendingReqs.load() == 0);
+        // Composite data and flush requests live in the chunks. Reserve (or
+        // reuse) the main handle's notification capacity and reset its prior
+        // terminal status before any chunk can post.
+        reserve(per_transfer_control_request_count);
         sharedState_->status.store(NIXL_SUCCESS);
         sharedState_->pendingReqs.store(getNumChunks());
     }
@@ -533,17 +581,18 @@ public:
         return true;
     }
 
-    void
-    release() override {
-        NIXL_TRACE << *this << " releasing";
-        nixlUcxBackendReqH::release();
-        if (sharedState_) {
-            // Set failed status to stop progress chunks
-            sharedState_->status.store(NIXL_ERR_NOT_FOUND);
-            // Reset shared state - it will be effectively released when the last chunk
-            // resets the shared state pointer
-            sharedState_.reset();
+    [[nodiscard]] nixl_status_t
+    tryRelease() override {
+        NIXL_TRACE << *this << " trying release";
+        const nixl_status_t main_status = nixlUcxBackendReqH::tryRelease();
+        if (main_status != NIXL_SUCCESS) {
+            return main_status;
         }
+
+        // Dedicated threads own raw pointers to the chunks until complete()
+        // decrements this counter. Keep the composite handle and shared state
+        // alive until every chunk has drained its UCX requests.
+        return sharedState_->pendingReqs.load() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
     }
 
     [[nodiscard]] nixl_status_t
@@ -617,8 +666,9 @@ protected:
                 if (status != NIXL_IN_PROG) {
                     NIXL_TRACE << "dedicated " << *this << " completing " << *(*it)
                                << " with status: " << status;
-                    (*it)->complete(status);
+                    auto completed_state = (*it)->complete(status);
                     it = requests_.erase(it);
+                    completed_state->pendingReqs.fetch_sub(1);
                 } else {
                     ++it;
                 }
@@ -626,13 +676,30 @@ protected:
         }
 
         if (!requests_.empty()) {
-            NIXL_WARN << "dedicated " << *this << " dropping " << requests_.size()
+            NIXL_WARN << "dedicated " << *this << " cancelling and draining " << requests_.size()
                       << " requests on exit";
             for (auto *req : requests_) {
-                NIXL_INFO << "dropping " << *req;
-                req->complete(NIXL_ERR_BACKEND);
+                req->requestCancel();
             }
-            requests_.clear();
+
+            // Engine teardown is allowed to block, unlike releaseReqH(). UCX
+            // cancellation itself is asynchronous, so continue progress until
+            // every chunk reports a terminal request cohort before freeing it.
+            while (!requests_.empty()) {
+                for (auto it = requests_.begin(); it != requests_.end();) {
+                    const nixl_status_t status = (*it)->status();
+                    if (status != NIXL_IN_PROG) {
+                        auto completed_state = (*it)->complete(status);
+                        it = requests_.erase(it);
+                        completed_state->pendingReqs.fetch_sub(1);
+                    } else {
+                        ++it;
+                    }
+                }
+                if (!requests_.empty()) {
+                    std::this_thread::yield();
+                }
+            }
         }
 
         NIXL_DEBUG << "dedicated " << *this << " exiting";
@@ -728,8 +795,19 @@ nixlUcxThreadPoolEngine::sendXferRange(const nixl_xfer_op_t &operation,
             nixl_status_t ret = nixlUcxEngine::sendXferRange(
                 operation, local, remote, remote_agent, chunk_handle, start_idx, end_idx);
             if (ret != NIXL_SUCCESS) {
-                status.store(ret);
-                chunk_handle->complete(ret);
+                nixl_status_t expected = NIXL_SUCCESS;
+                status.compare_exchange_strong(expected, ret);
+
+                // Posting can fail after earlier operations in this chunk were
+                // accepted. Do not drop its shared ownership until those
+                // requests (and the attempted flush) are terminal.
+                const nixl_status_t chunk_status = chunk_handle->status();
+                if (chunk_status == NIXL_IN_PROG) {
+                    thread->addRequest(chunk_handle);
+                } else {
+                    auto completed_state = chunk_handle->complete(chunk_status);
+                    completed_state->pendingReqs.fetch_sub(1);
+                }
             } else {
                 NIXL_TRACE << "dedicated " << *thread << " sent " << *chunk_handle;
                 thread->addRequest(chunk_handle);
@@ -1152,7 +1230,7 @@ nixlUcxEngine::sendXferSgl(nixlBackendReqH *handle) const {
 
     auto &ep = conn->getEp(int_handle->getWorkerId());
 
-    int_handle->reserve(single_ep_request_count);
+    int_handle->reserve(1 + per_transfer_control_request_count);
 
     nixlUcxReq req;
     const nixl_status_t post_ret = sgl.post(*ep, req);
@@ -1194,14 +1272,14 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
     }
 #endif
 
-    int_handle->reserve(single_ep_request_count);
+    int_handle->reserve((end_idx - start_idx) + per_transfer_control_request_count);
 
     const ucx_connection_ptr_t &conn =
         static_cast<nixlUcxPublicMetadata *>(remote[start_idx].metadataP)->conn;
     auto &ep = conn->getEp(worker_id);
 
     nixl_status_t status = NIXL_SUCCESS;
-    nixlUcxReq pending_req = nullptr;
+    bool operation_started = false;
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         void *laddr = (void *)local[i].addr;
@@ -1218,26 +1296,16 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
             ep->read(raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req) :
             ep->write(laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req);
 
-        if (ret == NIXL_IN_PROG) {
-            if (pending_req != nullptr) [[likely]] {
-                ucp_request_free(pending_req);
-            }
-            pending_req = req;
-        } else if (ret != NIXL_SUCCESS) {
+        if (ret == NIXL_SUCCESS || ret == NIXL_IN_PROG) {
+            operation_started = true;
+        }
+        if (int_handle->append(ret, req, conn) != NIXL_SUCCESS) {
             status = ret;
-            if (pending_req != nullptr) {
-                ucp_request_free(pending_req);
-                pending_req = nullptr;
-            }
             break;
         }
     }
 
-    if (status == NIXL_SUCCESS && pending_req) {
-        status = NIXL_IN_PROG;
-    }
-
-    if (int_handle->append(status, pending_req, conn) != NIXL_SUCCESS) {
+    if (!operation_started) {
         return status;
     }
 
@@ -1247,7 +1315,11 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
      */
     nixlUcxReq flush_req;
     const nixl_status_t flush_ret = ep->flushEp(flush_req);
-    if (int_handle->append(flush_ret, flush_req, conn) != NIXL_SUCCESS) {
+    const nixl_status_t append_flush_ret = int_handle->append(flush_ret, flush_req, conn);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    if (append_flush_ret != NIXL_SUCCESS) {
         return flush_ret;
     }
 
@@ -1308,6 +1380,11 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
         return handle_status;
     }
 
+    if (int_handle->releaseRequested()) {
+        int_handle->notif.reset();
+        return handle_status;
+    }
+
     nixlUcxBackendReqH::Notif notif(std::move(int_handle->notif).value());
     int_handle->notif.reset();
 
@@ -1334,7 +1411,10 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
 nixl_status_t nixlUcxEngine::releaseReqH(nixlBackendReqH* handle) const
 {
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
-    int_handle->release();
+    const nixl_status_t status = int_handle->tryRelease();
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
 
     /* TODO: return to a pool instead. */
     delete int_handle;

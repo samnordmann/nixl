@@ -63,11 +63,9 @@ bool operator!=(const nixlBasicDesc &lhs, const nixlBasicDesc &rhs) {
 }
 
 bool nixlBasicDesc::overlaps (const nixlBasicDesc &query) const {
-    if (devId != query.devId)
+    if (devId != query.devId || len == 0 || query.len == 0)
         return false;
-    if ((addr + len <= query.addr) || (query.addr + query.len <= addr))
-        return false;
-    return true;
+    return addr <= query.addr ? query.addr - addr < len : addr - query.addr < query.len;
 }
 
 nixl_blob_t nixlBasicDesc::serialize() const {

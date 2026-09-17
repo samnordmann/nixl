@@ -36,6 +36,7 @@ public:
     /* Ser/Des for Strings */
     nixl_status_t addStr(const std::string &tag, const std::string &str);
     std::string getStr(const std::string &tag);
+    nixl_status_t getStrChecked(const std::string &tag, std::string &str);
 
     /* Ser/Des for Byte buffers */
     nixl_status_t addBuf(const std::string &tag, const void* buf, ssize_t len);

@@ -18,6 +18,7 @@
 #include <map>
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include "nixl.h"
 #include "nixl_descriptors.h"
 #include "mem_section.h"
@@ -207,7 +208,8 @@ nixlMemSection::populate(const nixl_stride_dlist_t &query,
     size_t start_idx = 0;
     for (int i = 0; i < n; ++i) {
         const nixlStrideDesc &run = query[i];
-        if (run.count == 0 || run.len == 0 || run.stride < run.len) [[unlikely]] {
+        if (!run.isValid() ||
+            start_idx > std::numeric_limits<size_t>::max() - run.count) [[unlikely]] {
             resp.clear();
             return NIXL_ERR_INVALID_PARAM;
         }
