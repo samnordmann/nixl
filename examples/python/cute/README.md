@@ -30,7 +30,7 @@ manifest, automatic architecture selection, or binary distribution here.
 torchrun --standalone --nproc-per-node=2 examples/python/cute/put.py
 
 # 2. Same PUT, followed by a GPU signal and system-acquire wait.
-torchrun --standalone --nproc-per-node=2 examples/python/cute/put.py --signal
+torchrun --standalone --nproc-per-node=2 examples/python/cute/put.py --with-signal
 
 # 3. Dispatch -> stand-in experts -> weighted combine; drain, remove, rejoin.
 torchrun --standalone --nproc-per-node=2 examples/python/cute/moe.py

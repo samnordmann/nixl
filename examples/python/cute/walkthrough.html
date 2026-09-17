@@ -46,7 +46,7 @@ status[0] = ops.put(local_view, remote_view, byte_count,
 </section>
 <section id="signal">
 <h2>2. Make readiness observable on the GPU</h2>
-<pre><code>torchrun --standalone --nproc-per-node=2 examples/python/cute/put.py --signal</code></pre>
+<pre><code>torchrun --standalone --nproc-per-node=2 examples/python/cute/put.py --with-signal</code></pre>
 <p>The remote view has two descriptors: descriptor 0 is the receive slab, descriptor 1 is an array of 64-bit counters, one per source rank. The sender increments its counter only after a successful PUT.</p>
 <pre><code># Sender, same thread and transport channel:
 rc = ops.put(local, remote, bytes, src_offset, dst_offset)
