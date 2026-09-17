@@ -34,6 +34,12 @@ authors = [
 
 dependencies = ["torch", "numpy"]
 
+[project.optional-dependencies]
+# This source metadata describes nixl-cu12. The CUDA 13 release builder removes
+# the extra because CUTLASS DSL 4.5.1's cu13 dependency set has overlapping
+# wheels (NVIDIA/cutlass#3259); plain 4.5.1 is not a CUDA 13 substitute.
+cute = ["nvidia-cutlass-dsl==4.5.1", "cuda-python>=12.8,<13"]
+
 [tool.mypy]
 mypy_path = ["src/bindings/python/nixl-meta"]
 ignore_missing_imports = true

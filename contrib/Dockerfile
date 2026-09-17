@@ -393,6 +393,7 @@ RUN cd src/bindings/rust && cargo build --release --locked
 # torch - works on any base, no dependency on public torch wheels.
 # Redistributable wheels are produced by the wheel CI pipelines, not here.
 RUN CUDA_MAJOR=$(echo "${CUDA_VERSION}" | cut -d. -f1) && \
-    ./contrib/tomlutil.py --wheel-name "nixl-cu${CUDA_MAJOR}" pyproject.toml && \
+    if [ "$CUDA_MAJOR" = "13" ]; then CUTE_TOML_ARGS="--remove-extra cute"; else CUTE_TOML_ARGS=""; fi && \
+    ./contrib/tomlutil.py --wheel-name "nixl-cu${CUDA_MAJOR}" $CUTE_TOML_ARGS pyproject.toml && \
     uv pip install --system --no-build-isolation . && \
     uv pip install --system build/src/bindings/python/nixl-meta/nixl-*.whl

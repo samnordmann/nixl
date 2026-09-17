@@ -91,6 +91,13 @@ ARG BUILD_TYPE="release"
 ARG BUILD_NIXL_EP="true"
 ARG ABSL_TAG="lts_2025_08_14"
 ARG GRPC_TAG="v1.73.0"
+# CuTe DSL consumes LLVM bitcode and requires the producer toolchain to match
+# its LLVM major exactly. Build the small, required LLVM 20 distribution from
+# source so wheel_base remains compatible with AlmaLinux 8 / glibc 2.28 on
+# both x86_64 and aarch64. The generic upstream binary archives do not promise
+# a glibc 2.28 baseline and are therefore not a safe manylinux_2_28 dependency.
+ARG LLVM_VERSION="20.1.8"
+ARG LLVM_PROJECT_SHA256="6898f963c8e938981e6c4a302e83ec5beb4630147c7311183cf61069af16333d"
 ARG NPROC
 
 RUN yum groupinstall -y 'Development Tools' &&  \
@@ -127,7 +134,52 @@ RUN yum groupinstall -y 'Development Tools' &&  \
     librdmacm-devel \
     pciutils-devel \
     wget \
+    xz \
     zlib
+
+# Install only the LLVM tools required to produce and verify NIXL's CuTe
+# device bitcode. Keep the native backend for the host architecture and NVPTX
+# for CUDA; fail explicitly on an architecture not covered by the wheel matrix.
+RUN case "$ARCH" in \
+        x86_64) LLVM_NATIVE_TARGET="X86" ;; \
+        aarch64) LLVM_NATIVE_TARGET="AArch64" ;; \
+        *) echo "ERROR: LLVM 20 wheel toolchain does not support ARCH=$ARCH" >&2; exit 1 ;; \
+    esac && \
+    cd /tmp && \
+    wget -q --tries=3 --waitretry=5 \
+        "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" && \
+    echo "${LLVM_PROJECT_SHA256}  llvm-project-${LLVM_VERSION}.src.tar.xz" | sha256sum -c - && \
+    tar -xJf "llvm-project-${LLVM_VERSION}.src.tar.xz" && \
+    cmake -S "llvm-project-${LLVM_VERSION}.src/llvm" -B llvm-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/llvm-20 \
+        -DLLVM_ENABLE_PROJECTS=clang \
+        -DLLVM_TARGETS_TO_BUILD="${LLVM_NATIVE_TARGET};NVPTX" \
+        -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;llvm-dis;llvm-as" \
+        -DLLVM_ENABLE_ASSERTIONS=OFF \
+        -DLLVM_ENABLE_BINDINGS=OFF \
+        -DLLVM_ENABLE_LIBEDIT=OFF \
+        -DLLVM_ENABLE_LIBXML2=OFF \
+        -DLLVM_ENABLE_TERMINFO=OFF \
+        -DLLVM_ENABLE_ZLIB=OFF \
+        -DLLVM_ENABLE_ZSTD=OFF \
+        -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_INCLUDE_DOCS=OFF \
+        -DLLVM_INCLUDE_EXAMPLES=OFF \
+        -DLLVM_INCLUDE_TESTS=OFF \
+        -DCLANG_ENABLE_ARCMT=OFF \
+        -DCLANG_ENABLE_STATIC_ANALYZER=OFF && \
+    cmake --build llvm-build --parallel "${NPROC:-$(nproc)}" --target install-distribution && \
+    for LLVM_TOOL in clang opt llvm-dis llvm-as; do \
+        test -x "/opt/llvm-20/bin/${LLVM_TOOL}" && \
+        "/opt/llvm-20/bin/${LLVM_TOOL}" --version | grep -Eq 'version 20([.]|$)' || exit 1; \
+    done && \
+    find /opt/llvm-20/lib/clang -name __clang_cuda_runtime_wrapper.h -print -quit | grep -q . && \
+    rm -rf llvm-build "llvm-project-${LLVM_VERSION}.src" \
+        "llvm-project-${LLVM_VERSION}.src.tar.xz"
+
+ENV LLVM20_PATH=/opt/llvm-20/bin \
+    PATH=/opt/llvm-20/bin:${PATH}
 
 # Build latest hwloc from source to avoid older RHEL8 API limitations.
 RUN cd /tmp && \
@@ -505,6 +557,9 @@ RUN rm -rf build && \
     meson setup build/ --prefix=/usr/local/nixl --buildtype=$BUILD_TYPE $NIXL_EP_FLAG -Ducx_path=/usr/local \
     -Dcudapath_lib="/usr/local/cuda/lib64" \
     -Dcudapath_inc="/usr/local/cuda/include" \
+    -Dbuild_cute_device=enabled \
+    -Dcute_llvm_path=/opt/llvm-20/bin \
+    -Dcute_cuda_path=/usr/local/cuda \
     -Drelease_wheel=true && \
     cd build && \
     ninja && \

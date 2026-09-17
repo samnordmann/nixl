@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import pickle
 import sys
+import threading
+import weakref
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -44,6 +46,7 @@ def _is_torch_tensor(obj: object) -> bool:
 
 
 DEFAULT_COMM_PORT = nixlBind.DEFAULT_COMM_PORT
+NIXL_NULL_AGENT = nixlBind.NIXL_NULL_AGENT
 
 
 class nixl_prepped_dlist_handle:
@@ -84,6 +87,205 @@ class nixl_prepped_dlist_handle:
                     )
                 except Exception:
                     pass
+
+
+class nixl_device_view_handle:
+    """Owning handle for a device-visible NIXL memory view.
+
+    A view keeps the high-level agent, the converted descriptor list, and the
+    original input objects (including tensors) alive until :meth:`release`.
+    :attr:`descriptor_lengths` exposes an immutable size snapshot for CuTe's
+    trace-time bounds validation without exposing mutable native descriptors.
+    The caller must synchronize every CUDA kernel that can use this view before
+    releasing it or leaving its context manager; NIXL cannot infer CUDA stream
+    dependencies from the host.
+
+    Dropping a live handle triggers best-effort finalization and logs a warning.
+    Explicit release, preferably via ``with``, is strongly recommended.
+    """
+
+    __slots__ = (
+        "_count",
+        "_descriptor_lengths",
+        "_finalizer",
+        "_handle",
+        "_keepalive",
+        "_kind",
+        "_lock",
+        "_local_regions",
+        "_owner",
+        "_regions",
+        "_remote_agent",
+        "_remote_agents",
+        "__weakref__",
+    )
+
+    def __init__(
+        self,
+        owner,
+        handle: int,
+        *,
+        kind: str,
+        count: int,
+        remote_agent: Optional[str],
+        remote_agents: frozenset[str],
+        regions: tuple[tuple[object, int, int, int], ...],
+        local_regions: tuple[tuple[object, int, int, int], ...],
+        keepalive: tuple[object, ...],
+    ):
+        if not handle:
+            raise RuntimeError("NIXL returned a null device memory-view handle")
+        self._owner = owner
+        self._handle = int(handle)
+        self._kind = kind
+        self._count = count
+        self._descriptor_lengths = tuple(end - start for _, _, start, end in regions)
+        self._remote_agent = remote_agent
+        self._remote_agents = remote_agents
+        self._regions = regions
+        self._local_regions = local_regions
+        self._keepalive = keepalive
+        self._lock = threading.Lock()
+        self._finalizer = weakref.finalize(
+            self,
+            self._finalize,
+            owner,
+            self._handle,
+            self._lock,
+            keepalive,
+        )
+
+    @staticmethod
+    def _finalize(owner, handle: int, lock, keepalive) -> None:
+        # keepalive is intentionally captured by the finalizer so buffers remain
+        # alive through the native release. It otherwise has no use here.
+        with owner._device_view_lock, lock:
+            try:
+                logger.warning(
+                    "Finalizing live NIXL device view 0x%x; CUDA work must be "
+                    "synchronized before a view is released",
+                    handle,
+                )
+            except Exception:
+                # Logging modules can already be partially torn down during
+                # interpreter shutdown. Native cleanup must still be attempted.
+                pass
+            try:
+                owner.agent.releaseMemView(handle)
+            except Exception:
+                try:
+                    logger.error(
+                        "nixl_device_view_handle finalization failed for 0x%x",
+                        handle,
+                        exc_info=True,
+                    )
+                except Exception:
+                    pass
+        del keepalive
+
+    @property
+    def valid(self) -> bool:
+        """Whether the native memory-view handle is still live."""
+        return self._finalizer.alive
+
+    @property
+    def is_valid(self) -> bool:
+        """Alias for :attr:`valid`, used by CuTe JIT argument adapters."""
+        return self.valid
+
+    @property
+    def handle(self) -> int:
+        """Raw device-visible handle, suitable for CuTe DSL JIT arguments."""
+        if not self.valid:
+            raise RuntimeError("NIXL device memory view has been released")
+        return self._handle
+
+    @property
+    def count(self) -> int:
+        """Compatibility alias for :attr:`descriptor_count`."""
+        return self._count
+
+    @property
+    def descriptor_count(self) -> int:
+        """Number of descriptors in this view."""
+        return self._count
+
+    @property
+    def descriptor_lengths(self) -> tuple[int, ...]:
+        """Immutable byte lengths for trace-time descriptor bounds checks."""
+        return self._descriptor_lengths
+
+    @property
+    def kind(self) -> str:
+        """View locality: ``\"local\"`` or ``\"remote\"``."""
+        return self._kind
+
+    @property
+    def remote_agents(self) -> frozenset[str]:
+        """Remote agents referenced by this view, empty for a local view."""
+        return self._remote_agents
+
+    @property
+    def descriptor_addresses(self) -> tuple[int, ...]:
+        """Owner/original base address for every prepared descriptor.
+
+        For a remote view these are the addresses advertised by each peer, not
+        necessarily the process-local pointers returned by a device
+        ``nixlGetPtr``. Numeric equality across process address spaces is not a
+        correctness requirement. Applications using the direct mapped fast
+        path must address a remote allocation from its non-null process-local
+        ``nixlGetPtr`` base plus the descriptor-relative offset.
+        """
+        return tuple(start for _, _, start, _ in self._regions)
+
+    def __repr__(self) -> str:
+        handle = f"0x{self._handle:x}" if self.valid else "released"
+        return (
+            f"nixl_device_view_handle({handle}, kind={self._kind!r}, "
+            f"count={self._count})"
+        )
+
+    def _overlaps_local_registration(self, dlist) -> bool:
+        mem_type = dlist.getType()
+        for i in range(dlist.descCount()):
+            addr, length, device_id, *_ = dlist[i]
+            start = int(addr)
+            end = start + int(length)
+            for view_mem, view_device, view_start, view_end in self._local_regions:
+                if (
+                    mem_type == view_mem
+                    and int(device_id) == view_device
+                    and start < view_end
+                    and view_start < end
+                ):
+                    return True
+        return False
+
+    def release(self) -> None:
+        """Release the native view after all CUDA users have synchronized.
+
+        This operation is idempotent. If native release fails, the handle stays
+        valid so the caller can synchronize or otherwise recover and retry.
+        """
+        with self._owner._device_view_lock, self._lock:
+            if not self._finalizer.alive:
+                return
+            self._owner.agent.releaseMemView(self._handle)
+            self._finalizer.detach()
+            self._owner._device_views.discard(self)
+            self._keepalive = ()
+
+    def close(self) -> None:
+        """Alias for :meth:`release` for conventional resource management."""
+        self.release()
+
+    def __enter__(self):
+        if not self.valid:
+            raise RuntimeError("Cannot enter a released NIXL device memory view")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
 
 
 class nixl_xfer_handle:
@@ -230,6 +432,8 @@ class nixl_agent:
 
         self.name = agent_name
         self._leaked_xfer_handles: list[int] = []
+        self._device_views: weakref.WeakSet[nixl_device_view_handle] = weakref.WeakSet()
+        self._device_view_lock = threading.RLock()
         self.notifs: dict[str, list[bytes]] = {}
         self.backends: dict[str, nixl_backend_handle] = {}
         self.backend_mems: dict[str, list[str]] = {}
@@ -443,7 +647,17 @@ class nixl_agent:
         handle_list = []
         for backend_string in backends:
             handle_list.append(self.backends[backend_string])
-        self.agent.deregisterMem(dereg_list, handle_list)
+
+        with self._device_view_lock:
+            affects_ucx = not backends or "UCX" in backends
+            if affects_ucx:
+                for view in tuple(self._device_views):
+                    if view.valid and view._overlaps_local_registration(dereg_list):
+                        raise RuntimeError(
+                            "Cannot deregister memory overlapping an active NIXL "
+                            "device view; synchronize CUDA work and release the view first"
+                        )
+            self.agent.deregisterMem(dereg_list, handle_list)
 
     def query_memory(
         self, reg_list, backend: str, mem_type: Optional[str] = None
@@ -739,46 +953,254 @@ class nixl_agent:
         """
         handle.release()
 
-    """
-    @brief Prepare a memory view handle for either a local or remote
-           descriptor list. The underlying pybind11 overloads of
-           nixlAgent::prepMemView are dispatched by the descriptor list type:
-             - Local : prep_mem_view(dlist: nixlXferDList, backends=[])
-             - Remote: prep_mem_view(dlist: nixlRemoteDList, backends=[])
-           Build the remote list with get_remote_descs.
-           Returns the raw uintptr handle; pair with release_mem_view to free.
-
-    @param dlist A local (nixlXferDList) or remote (nixlRemoteDList) dlist.
-    @param backends Optional list of backend names to limit the preparation to.
-    @return Opaque uintptr handle for the memory view.
-    @note Requires NIXL built against a UCX with the GPU device API (probe via
-          nixl._bindings.HAVE_UCX_GPU_DEVICE_API); otherwise the backend raises
-          nixlBackendError. The descriptors must reference device (VRAM) memory,
-          and an active CUDA context must already exist when the owning agent is
-          created. For a remote dlist, the remote agent's metadata -- including
-          the registered region being viewed -- must be loaded first via
-          add_remote_agent.
-    """
-
     def prep_mem_view(
         self,
         dlist: Union[nixlBind.nixlXferDList, nixlBind.nixlRemoteDList],
         *,
         backends: Optional[list[str]] = None,
+        worker_id: Optional[int] = None,
+        connection_timeout_ms: Optional[int] = None,
     ) -> int:
+        """Prepare a raw local or remote device memory-view handle.
+
+        This low-level compatibility API does not retain buffers or protect
+        registrations. New code should use :meth:`prepare_device_view`.
+        ``connection_timeout_ms`` applies only to a remote descriptor list.
+        """
         handle_list = []
         for backend_string in backends or []:
             handle_list.append(self.backends[backend_string])
-        return self.agent.prepMemView(dlist, handle_list)
 
-    """
-    @brief Release a memory view handle previously returned by prep_mem_view.
-
-    @param mvh uintptr handle returned by prep_mem_view.
-    """
+        if isinstance(dlist, nixlBind.nixlRemoteDList):
+            return self.agent.prepMemView(
+                dlist, handle_list, worker_id, connection_timeout_ms
+            )
+        return self.agent.prepMemView(dlist, handle_list, worker_id)
 
     def release_mem_view(self, mvh: int) -> None:
-        self.agent.releaseMemView(mvh)
+        """Release a memory-view handle.
+
+        If ``mvh`` belongs to an owning :meth:`prepare_device_view` result,
+        route release through that object so its lifetime guard is invalidated
+        atomically with the native handle. Raw handles returned by
+        :meth:`prep_mem_view` retain the compatibility behavior.
+        """
+        with self._device_view_lock:
+            for view in tuple(self._device_views):
+                if view.valid and view._handle == mvh:
+                    view.release()
+                    return
+            self.agent.releaseMemView(mvh)
+
+    def prepare_device_view(
+        self,
+        xfer_list,
+        remote_agent: Optional[str] = None,
+        mem_type: Optional[str] = None,
+        backend: str = "UCX",
+        worker_id: Optional[int] = None,
+        connection_timeout_ms: Optional[int] = 30000,
+    ) -> nixl_device_view_handle:
+        """Prepare an owning VRAM view for use by NIXL's CuTe device API.
+
+        Version 3 supports only the UCX backend and VRAM descriptors. For a
+        single peer, ``remote_agent`` applies that name to every descriptor.
+        A ``nixlRemoteDList`` or list of ``(address, length, device_id,
+        agent_name)`` tuples may instead name a different peer per descriptor,
+        allowing one persistent kernel to index a composite multi-peer view.
+        Every composite descriptor must name an addressable agent. Current UCX
+        GPU device lists do not safely support ``NULL_AGENT`` gaps: an all-gap
+        list cannot be created and transport operations on a gap are invalid.
+        Fixed-capacity applications should pad inactive slots with a registered
+        local loopback descriptor and guard them in device control flow.
+        Metadata for every non-local peer must already be loaded. The returned
+        handle retains the original input objects and converted descriptors.
+
+        The caller must synchronize every CUDA kernel using the view before
+        calling :meth:`nixl_device_view_handle.release`. For remote views,
+        ``connection_timeout_ms`` bounds endpoint wire-up by default. Set it to
+        ``None`` only when an unbounded wait is explicitly intended.
+        """
+        if backend != "UCX":
+            raise ValueError(
+                f"NIXL CuTe device views support only backend='UCX' (got {backend!r})"
+            )
+        if backend not in self.backends:
+            raise RuntimeError(
+                "UCX backend must be initialized before preparing a device view"
+            )
+        # getBackendParams() exposes canonical NIXL enum names (for example,
+        # "VRAM_SEG"), not the shorter public Python input aliases.
+        if "VRAM_SEG" not in self.backend_mems.get(backend, ()):
+            raise RuntimeError("The initialized UCX backend does not support VRAM")
+        if not getattr(nixlBind, "HAVE_UCX_GPU_DEVICE_API", False):
+            raise RuntimeError(
+                "NIXL was built without the UCX GPU device API required by CuTe views"
+            )
+        if mem_type not in (None, "VRAM"):
+            raise ValueError(
+                f"NIXL CuTe device views require mem_type='VRAM' (got {mem_type!r})"
+            )
+        if isinstance(worker_id, bool) or (
+            worker_id is not None
+            and (
+                not isinstance(worker_id, int)
+                or worker_id < 0
+                or worker_id > sys.maxsize
+            )
+        ):
+            raise ValueError(
+                "worker_id must be a non-negative platform-sized integer or None"
+            )
+        if isinstance(connection_timeout_ms, bool) or (
+            connection_timeout_ms is not None
+            and (
+                not isinstance(connection_timeout_ms, int)
+                or connection_timeout_ms <= 0
+                or connection_timeout_ms > sys.maxsize
+            )
+        ):
+            raise ValueError(
+                "connection_timeout_ms must be a positive platform-sized integer or None"
+            )
+        is_remote_coordinates = (
+            isinstance(xfer_list, (list, tuple))
+            and bool(xfer_list)
+            and isinstance(xfer_list[0], tuple)
+            and len(xfer_list[0]) == 4
+        )
+        is_explicit_remote = (
+            isinstance(xfer_list, nixlBind.nixlRemoteDList) or is_remote_coordinates
+        )
+        if is_explicit_remote and remote_agent is not None:
+            raise ValueError(
+                "remote_agent must be None when xfer_list is a nixlRemoteDList"
+            )
+        if remote_agent is not None and (
+            not isinstance(remote_agent, str) or not remote_agent
+        ):
+            raise ValueError("remote_agent must be a non-empty string or None")
+        if remote_agent == NIXL_NULL_AGENT:
+            raise ValueError(
+                "remote_agent cannot be NULL_AGENT; use a registered local "
+                "loopback descriptor for an inactive slot"
+            )
+        if xfer_list is None:
+            raise TypeError("xfer_list must not be None")
+        try:
+            if len(xfer_list) == 0:
+                raise ValueError("xfer_list must contain at least one descriptor")
+        except TypeError:
+            # Native descriptor lists do not expose __len__; isEmpty below is
+            # authoritative after normalization.
+            pass
+
+        if is_remote_coordinates:
+            normalized_remote = []
+            for descriptor in xfer_list:
+                if not isinstance(descriptor, tuple) or len(descriptor) != 4:
+                    raise ValueError(
+                        "every composite remote descriptor must be an "
+                        "(address, length, device_id, agent_name) tuple"
+                    )
+                address, length, device_id, agent_name = descriptor
+                if agent_name is None:
+                    raise ValueError(
+                        "composite remote descriptors cannot use None/NULL_AGENT; "
+                        "pad inactive slots with a registered local loopback descriptor"
+                    )
+                elif not isinstance(agent_name, str) or not agent_name:
+                    raise ValueError(
+                        "composite remote agent names must be non-empty strings "
+                        "or None"
+                    )
+                normalized_remote.append((address, length, device_id, agent_name))
+            descs = self.get_remote_descs(normalized_remote, mem_type)
+        elif is_explicit_remote:
+            descs = xfer_list
+        else:
+            descs = self.get_xfer_descs(xfer_list, mem_type)
+        if descs is None:
+            raise ValueError("Could not convert xfer_list to NIXL transfer descriptors")
+        if descs.isEmpty():
+            raise ValueError("xfer_list must contain at least one descriptor")
+        if descs.getType() != nixlBind.VRAM_SEG:
+            raise ValueError("NIXL CuTe device views require VRAM descriptors")
+
+        regions = []
+        local_regions = []
+        remote_agents: set[str] = set()
+        for i in range(descs.descCount()):
+            descriptor = descs[i]
+            addr, length, device_id = descriptor[:3]
+            if int(length) <= 0:
+                raise ValueError(f"descriptor {i} must have a positive length")
+            descriptor_agent = remote_agent
+            if is_explicit_remote:
+                descriptor_agent = descriptor[3]
+                if not isinstance(descriptor_agent, str) or not descriptor_agent:
+                    raise ValueError(
+                        f"remote descriptor {i} must name a non-empty agent"
+                    )
+                if descriptor_agent == NIXL_NULL_AGENT:
+                    raise ValueError(
+                        "composite remote descriptors cannot use NULL_AGENT; "
+                        "pad inactive slots with a registered local loopback descriptor"
+                    )
+                remote_agents.add(descriptor_agent)
+            start = int(addr)
+            region = (descs.getType(), int(device_id), start, start + int(length))
+            regions.append(region)
+            if descriptor_agent is None or descriptor_agent == self.name:
+                local_regions.append(region)
+
+        if remote_agent is not None:
+            remote_agents.add(remote_agent)
+
+        backend_handles = [self.backends[backend]]
+        kind = "remote" if is_explicit_remote or remote_agents else "local"
+        keepalive: tuple[object, ...]
+        if isinstance(xfer_list, (list, tuple)):
+            # Retain a snapshot of container members as well as the container
+            # itself. A caller clearing a list of tensors must not free their
+            # storage while a device view still references it.
+            keepalive = (xfer_list, tuple(xfer_list), descs)
+        else:
+            keepalive = (xfer_list, descs)
+        with self._device_view_lock:
+            if is_explicit_remote:
+                raw_handle = self.agent.prepMemView(
+                    descs,
+                    backend_handles,
+                    worker_id,
+                    connection_timeout_ms,
+                )
+            elif remote_agent is None:
+                raw_handle = self.agent.prepLocalMemView(
+                    descs, backend_handles, worker_id
+                )
+            else:
+                raw_handle = self.agent.prepRemoteMemView(
+                    remote_agent,
+                    descs,
+                    backend_handles,
+                    worker_id,
+                    connection_timeout_ms,
+                )
+
+            view = nixl_device_view_handle(
+                self,
+                raw_handle,
+                kind=kind,
+                count=descs.descCount(),
+                remote_agent=remote_agent,
+                remote_agents=frozenset(remote_agents),
+                regions=tuple(regions),
+                local_regions=tuple(local_regions),
+                keepalive=keepalive,
+            )
+            self._device_views.add(view)
+            return view
 
     def get_new_notifs(self, backends: list[str] = []) -> dict[str, list[bytes]]:
         """Get new notifications that have come to the agent.
@@ -859,12 +1281,12 @@ class nixl_agent:
             remote_agent_name: Name of the remote agent.
             notif_msg: Message to send, it will be received as bytes.
                 notif_msg should be bytes, as that is what will be returned to the target, but will work with str too.
-            backends: Optional a backend name to use to send the notifications.
+            backend: Optional backend name to use to send the notification.
         """
         if backend is None:
             self.agent.genNotif(remote_agent_name, notif_msg)
         else:
-            self.agent.genNotif(remote_agent_name, notif_msg, self.backends[backend])
+            self.agent.genNotif(remote_agent_name, notif_msg, [self.backends[backend]])
 
     def get_agent_metadata(self) -> bytes:
         """Get the full metadata of the local agent.
@@ -917,7 +1339,18 @@ class nixl_agent:
         Args:
             agent: Name of the remote agent.
         """
-        self.agent.invalidateRemoteMD(agent)
+        with self._device_view_lock:
+            for view in tuple(self._device_views):
+                if (
+                    view.valid
+                    and view.kind == "remote"
+                    and agent in view._remote_agents
+                ):
+                    raise RuntimeError(
+                        f"Cannot remove remote agent {agent!r} while a device view "
+                        "references it; synchronize CUDA work and release the view first"
+                    )
+            self.agent.invalidateRemoteMD(agent)
 
     def send_local_metadata(self, ip_addr: str = "", port: int = DEFAULT_COMM_PORT):
         """Send all of your metadata to a peer or central metadata server.

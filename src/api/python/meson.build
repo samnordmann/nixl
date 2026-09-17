@@ -19,3 +19,23 @@ py.install_sources('_api.py', subdir: (cuda_wheel_dir))
 py.install_sources('__init__.py', subdir: (cuda_wheel_dir))
 py.install_sources('py.typed', subdir: (cuda_wheel_dir))
 py.install_sources('logging.py', subdir: (cuda_wheel_dir))
+
+py.install_sources(
+  'device/__init__.py',
+  subdir: join_paths(cuda_wheel_dir, 'device'),
+)
+if cute_device_enabled
+  py.install_sources(
+    [
+      'device/cute/__init__.py',
+      'device/cute/_bindings.py',
+      'device/cute/_bitcode.py',
+      'device/cute/_mlir.py',
+      'device/cute/memory.py',
+      'device/cute/ops.py',
+      'device/cute/topology.py',
+      'device/cute/types.py',
+    ],
+    subdir: join_paths(cuda_wheel_dir, 'device', 'cute'),
+  )
+endif
