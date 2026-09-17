@@ -62,3 +62,16 @@ See the [Python examples](../examples/python/) directory for complete working ex
 - [nixl_api_example.py](../examples/python/nixl_api_example.py) - General API usage
 - [basic_two_peers.py](../examples/python/basic_two_peers.py) - Basic transfer operations
 - [partial_md_example.py](../examples/python/partial_md_example.py) - Partial metadata handling
+# Experimental PyTorch Core provider
+
+`nixl.torch_transfer.NixlBackend(agent)` implements the private
+`torch.distributed._transfer` prototype without changing NIXL's native API.
+Inject it into `Endpoint`; prepare catalogs once and select blocks by index.
+`TorchTransferAgent(agent, owner=...)` is a small migration shim for existing
+framework integrations. It preserves native metadata, wire descriptor objects,
+backend settings and notification bytes while routing the data path through Core.
+
+The prototype supports DRAM/VRAM and success-path READ/WRITE. Completed work is
+released explicitly. Active cancellation, failure recovery and native-performance
+parity are **not** provided or validated. Install the matching PyTorch prototype;
+ordinary NIXL users do not import this optional module or acquire a Torch dependency.
