@@ -58,13 +58,15 @@ toUcpFlags(uint64_t nixl_flags) noexcept {
 
 /**
  * Convert the status of a *submission*, which is not the same mapping as a
- * completion poll. UCS_OK here means UCX accepted the operation, not that it
- * finished: the transfer is reported complete later, through getXferStatus.
- * Any non-error therefore reports NIXL_IN_PROG, and only getXferStatus is
- * allowed to return NIXL_SUCCESS.
+ * completion poll. With a request, UCS_OK is synchronous completion; polling
+ * that request would read uninitialized UCX completion state. Requestless
+ * submission still needs an application completion/credit protocol.
  */
 __device__ inline nixl_status_t
-convertSubmitStatus(ucs_status_t status) {
+convertSubmitStatus(ucs_status_t status, bool has_request) {
+    if (has_request && status == UCS_OK) {
+        return NIXL_SUCCESS;
+    }
     if (!UCS_STATUS_IS_ERR(status)) {
         return NIXL_IN_PROG;
     }
@@ -125,7 +127,7 @@ put(const memViewElem &src,
                                                                      channel_id,
                                                                      toUcpFlags(flags),
                                                                      requestPtr(xfer_status));
-    return convertSubmitStatus(status);
+    return convertSubmitStatus(status, xfer_status != nullptr);
 }
 
 template<level_t level>
@@ -144,7 +146,7 @@ atomicAdd(uint64_t value,
                                                              channel_id,
                                                              toUcpFlags(flags),
                                                              requestPtr(xfer_status));
-    return convertSubmitStatus(status);
+    return convertSubmitStatus(status, xfer_status != nullptr);
 }
 
 __device__ inline void *

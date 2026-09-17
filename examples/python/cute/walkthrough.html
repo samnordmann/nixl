@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NIXL + CuTe: the review prototype</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f7fa;--paper:#fff;--ink:#203142;--muted:#526477;--line:#d6e0e8;--accent:#075e85;--code:#edf3f7}
+@media(prefers-color-scheme:dark){:root{--bg:#15202b;--paper:#1d2b39;--ink:#e4edf4;--muted:#b7c6d4;--line:#45596c;--accent:#8cd5ef;--code:#243746}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.65 system-ui,sans-serif}main{max-width:940px;margin:auto;padding:36px 26px 80px}header,section{background:var(--paper);border:1px solid var(--line);padding:28px 32px;margin-bottom:20px;border-radius:10px}h1{font-size:36px;line-height:1.2;letter-spacing:-.03em}h2{font-size:25px;line-height:1.3}h3{font-size:19px}a{color:var(--accent)}p{margin:12px 0}nav{display:flex;flex-wrap:wrap;gap:8px 20px}pre{overflow:auto;background:var(--code);padding:18px;border-radius:6px;font-size:13px;line-height:1.6}code{font-family:ui-monospace,monospace;overflow-wrap:anywhere}pre code{overflow-wrap:normal}.note{border-left:4px solid var(--accent);padding-left:16px;color:var(--muted)}.flow{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:22px 0}.flow span{padding:10px 14px;background:var(--code);border-radius:6px}.small{font-size:14px;color:var(--muted)}li{margin:8px 0}table{width:100%;border-collapse:collapse;font-size:15px}td,th{text-align:left;vertical-align:top;padding:10px;border-bottom:1px solid var(--line)}@media(max-width:600px){main{padding:16px 12px}header,section{padding:20px}h1{font-size:29px}}@media print{body{background:white}header,section{break-inside:avoid}a{color:inherit}}
+</style>
+</head>
+<body><main>
+<header>
+<p class="small">Technical-review MVP · source-only · September 2026</p>
+<h1>NIXL from a CuTe kernel</h1>
+<p>The question is small: <strong>can a CuTe kernel call NIXL's device API, and can we compose those calls into understandable MoE communication?</strong> This prototype answers it with three operations and two programs. It is not a production runtime.</p>
+<nav aria-label="Tutorial"><a href="#design">Design</a><a href="#setup">Build</a><a href="#put">1. PUT</a><a href="#signal">2. Signal</a><a href="#moe">3. MoE</a><a href="#elastic">4. Elasticity</a><a href="#review">Review map</a></nav>
+</header>
+<section id="design">
+<h2>The entire integration</h2>
+<div class="flow" aria-label="Device call chain"><span>CuTe kernel</span>→<span>three private wrappers</span>→<span>NIXL device API</span>→<span>UCX</span></div>
+<p><a href="nixl_cute.py">nixl_cute.py</a> declares CuTe external functions. <a href="device.cu">device.cu</a> implements them with <code>nixlPut</code>, <code>nixlAtomicAdd</code>, and a system-acquire counter load. <a href="build.py">build.py</a> compiles that small translation unit into LLVM bitcode, which CuTe links into the kernel.</p>
+<p>We still need matching function signatures for the compiler. We do <em>not</em> promise a stable ABI: there is no ABI version, compatibility matrix, manifest, wheel integration, or automatic artifact selection. Rebuild the shims together with NIXL and UCX.</p>
+<p>Host setup uses NIXL's existing <code>register_memory</code>, <code>get_xfer_descs</code>, <code>get_remote_descs</code>, and <code>prep_mem_view</code>. Their opaque integer handles become <code>Uint64</code> kernel arguments. No new owning-handle class is introduced. The application explicitly keeps the original resources alive.</p>
+<p class="note">This example uses one GPU thread per device call. It establishes the integration and ordering model, not a throughput target. An optimized warp/persistent implementation is a later, separate review.</p>
+</section>
+<section id="setup">
+<h2>Before running</h2>
+<p>Use separate GPUs on one node and NIXL built from this checkout with UCX GPU-device support. The validated setup is GB200, NVIDIA PyTorch 26.06 (CUDA 13.3), UCX 1.21.0, CUTLASS DSL 4.5.1, and LLVM 20. Use the same UCX installation for the host library and the device shims. All four tutorial commands below passed on this setup, as did the 12 CPU checks; this is correctness evidence, not a performance result.</p>
+<pre><code># From the repository root, after building/installing NIXL:
+export PYTHONPATH="$PWD/src/bindings/python/nixl-meta:$PYTHONPATH"
+python examples/python/cute/build.py --ucx /opt/hpcx/ucx --arch sm_100</code></pre>
+<p><code>sm_100</code> is the GB200 target; choose the actual GPU architecture. Rebuild <code>device.bc</code> after changing it or the headers/toolchain. Use an external job timeout: this prototype does not recover a device waiting on a lost peer.</p>
+<p>The launcher creates one process per GPU. Gloo exchanges only CPU metadata, route records, and barriers. The GPU activation and result transfers below are NIXL operations issued from CuTe.</p>
+</section>
+<section id="put">
+<h2>1. Copy a registered GPU buffer</h2>
+<pre><code>torchrun --standalone --nproc-per-node=2 examples/python/cute/put.py</code></pre>
+<p>Each rank allocates send and receive slabs, registers them, exchanges addresses plus NIXL metadata, and prepares a local send view and a remote receive view. Both ranks then copy to the other.</p>
+<pre><code># Inside a one-thread CuTe kernel:
+status[0] = ops.put(local_view, remote_view, byte_count,
+                    source_byte_offset, destination_byte_offset)</code></pre>
+<p>The wrapper waits for its request <em>on the GPU</em>; this is not a CPU synchronization call. The teaching harness subsequently drains the stream and uses a host barrier before checking the receive buffer. It repeats with changing values to exercise reuse, rather than merely checking an initially zero buffer.</p>
+<p>The only native-header fix preserves UCX's synchronous-completion result. A CUDA-IPC operation can complete immediately without initializing a pending request; treating it as still in progress would poll invalid completion state. See <a href="../../../src/api/device/gpu/impl/ucx/device_ucx.cuh">the small native change</a>.</p>
+</section>
+<section id="signal">
+<h2>2. Make readiness observable on the GPU</h2>
+<pre><code>torchrun --standalone --nproc-per-node=2 examples/python/cute/put.py --with-signal</code></pre>
+<p>The remote view has two descriptors: descriptor 0 is the receive slab, descriptor 1 is an array of 64-bit counters, one per source rank. The sender increments its counter only after a successful PUT.</p>
+<pre><code># Sender, same thread and transport channel:
+rc = ops.put(local, remote, bytes, src_offset, dst_offset)
+if rc == 0:
+    ops.signal(remote, source_rank * 8)
+
+# Receiver, before reading the payload:
+ops.wait(local_counter_address + source_rank * 8, expected_count)</code></pre>
+<p>A system release fence precedes the counter increment; the receiver polls with a system-acquire load. The counter is therefore a publication boundary, not just an integer that happens to change. Expected counts increase across exchanges and membership changes; they are not reset on rejoin.</p>
+<p class="note">A ready signal is not a reuse credit. This MVP uses coarse stream drains and all-rank barriers to ensure old receive contents are consumed before the next exchange overwrites them. It intentionally does not implement a GPU credit scheduler.</p>
+</section>
+<section id="moe">
+<h2>3. Compose a complete MoE communication round</h2>
+<pre><code>torchrun --standalone --nproc-per-node=2 examples/python/cute/moe.py</code></pre>
+<p><a href="moe.py">moe.py</a> is separate from the binding. It uses eight tokens per rank, hidden size 128, top-2 routing, two experts per rank, BF16 payloads, and FP32 weighted accumulation. Its CPU router makes the route decisions easy to inspect.</p>
+<div class="flow" aria-label="MoE round"><span>route + pack</span>→<span>NIXL dispatch</span>→<span>expert</span>→<span>NIXL return</span>→<span>weighted combine</span></div>
+<pre><code>records[owner] = [(token, route_slot, expert_id), ...]
+send[owner, row] = input[token]
+exchange()                         # recv is indexed by original source
+
+send[source, row] = expert(recv[source, row])
+exchange()                         # results return in the same row order
+
+output[token] += weight[token, route_slot] * returned[owner, row]</code></pre>
+<p>Every source owns a fixed receive segment at every destination. We reserve <code>tokens × top_k</code> rows per source/destination pair and send padded slabs. This wastes bandwidth but removes variable-size allocation, receive reservation, and GPU packing from the first review. Routing records travel through the CPU control plane; only the BF16 payloads use NIXL.</p>
+<p>The stand-in expert is <code>x × (expert_id + 1)</code>, rounded to BF16. The source multiplies returned values by its original gate weights, sums in FP32, and casts once. A separate CPU golden calculation checks every generation. This validates dispatch/return correspondence; it does not measure a real FFN or grouped GEMM.</p>
+<p><strong>Exercise:</strong> use the record <code>(token=3, slot=1, expert=5)</code>. With two experts per rank, it goes to rank 2. After the return transfer, the original source combines that row into token 3 using weight slot 1; receive row number is not token identity.</p>
+</section>
+<section id="elastic">
+<h2>4. Change membership without renumbering experts</h2>
+<pre><code>torchrun --standalone --nproc-per-node=3 examples/python/cute/moe.py \
+  --membership '0,1;0,1,2;0,2;0,1,2'</code></pre>
+<p>The sequence expands, removes rank 1 while leaving a hole, then rejoins it. Expert IDs always mean <code>rank × 2 + local_expert</code>: rank 2 retains experts 4 and 5 even when rank 1 is absent. The router masks inactive owners before top-k selection.</p>
+<pre><code>load joining peers' metadata and stage their device views
+drain old GPU work; synchronize the ranks
+commit the new active set; release removed views and metadata
+run the next dispatch / expert / combine round</code></pre>
+<p>All maximum-capacity processes and registered buffers remain alive as standbys. No rank is killed or replaced. The protocol relies on drained phase boundaries, not stale-message recovery, overlapping membership changes, or failure detection. <a href="common.py">World.membership</a> contains the entire control-plane transition.</p>
+<p><strong>Teardown rule:</strong> finish kernels, release every local/remote view, synchronize the owners, then deregister memory. A remote view never grants ownership of another process's storage.</p>
+</section>
+<section id="review">
+<h2>What to review—and what is intentionally absent</h2>
+<table><thead><tr><th>Read</th><th>Question</th></tr></thead><tbody>
+<tr><td><a href="nixl_cute.py">nixl_cute.py</a> + <a href="device.cu">device.cu</a></td><td>Is this a suitable minimal boundary between CuTe and the existing NIXL device API?</td></tr>
+<tr><td><a href="common.py">common.py</a></td><td>Are preparation, publication, consumption, and teardown ordered correctly?</td></tr>
+<tr><td><a href="moe.py">moe.py</a></td><td>Are routing records and returning expert results matched to the right token?</td></tr>
+<tr><td><a href="build.py">build.py</a></td><td>Can the small linking shim be built with the selected CUDA/UCX/CuTe toolchain?</td></tr>
+<tr><td><a href="../../../test/python/test_cute_mvp.py">CPU tests</a></td><td>Do sparse routing, stable IDs, weighted combine, and IR cleanup match the model?</td></tr>
+</tbody></table>
+<p>No stable ABI, wheel changes, ownership framework, persistent scheduler, generic topology framework, benchmark suite, process replacement, crash recovery, or CUDA graph replay. Those are separate proposals, not prerequisites for reviewing these three calls.</p>
+<p class="small">Source references: the linked files are authoritative for this prototype. For the compiler mechanism, see the official <a href="https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute.html#cutlass.cute.extern">CuTe extern</a> and <a href="https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute.html#cutlass.cute.BitCode">BitCode</a> documentation. The existing native <a href="../../device/ep/tests/elastic/elastic.py">NIXL EP elastic example</a> is the broader reference; this MVP implements only graceful standby membership.</p>
+</section>
+</main></body></html>

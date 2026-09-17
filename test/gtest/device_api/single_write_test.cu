@@ -54,7 +54,7 @@ putKernel(putParams put_params,
                                      put_params.channelId,
                                      put_params.flags,
                                      &xfer_status);
-        if (status != NIXL_IN_PROG) {
+        if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
             printf("Thread %d: nixlPut failed iteration %zu: status=%d (0x%x)\n",
                    threadIdx.x,
                    i,
@@ -63,9 +63,9 @@ putKernel(putParams put_params,
             return;
         }
 
-        do {
+        while (status == NIXL_IN_PROG) {
             status = nixlGpuGetXferStatus<level>(xfer_status);
-        } while (status == NIXL_IN_PROG);
+        }
 
         if (status != NIXL_SUCCESS) {
             printf("Thread %d: Transfer completion failed iteration %zu: status=%d\n",
