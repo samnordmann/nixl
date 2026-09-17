@@ -3,7 +3,7 @@
 
 """Host-side layout and correctness model for the NIXL CuTe MoE examples.
 
-Protocol control-plane imports intentionally do not import Torch.
+Protocol and pipeline control-plane imports intentionally do not import Torch.
 The tensor-valued reference model is loaded lazily when one of its public
 symbols is first requested, which keeps membership planning usable on login and
 CPU-only nodes.
@@ -25,6 +25,23 @@ from .arena import (
     align_up,
 )
 from .ll_protocol import PipelineLLArenaLayout, StableSparseTopology
+from .pipeline import (
+    GENERATION_REBASE_PLANES,
+    AbruptPeerLoss,
+    CombineEvents,
+    DispatchHandle,
+    GenerationChangeState,
+    GenerationCommit,
+    GenerationDrain,
+    HandleState,
+    MoEPipeline,
+    PipelineBackend,
+    PipelineBankBuffers,
+    PipelineError,
+    PipelineFailed,
+    PipelineState,
+    StagedGeneration,
+)
 
 _REFERENCE_EXPORTS = frozenset(
     {
@@ -67,17 +84,32 @@ __all__ = [
     "UINT64_MAX",
     "DispatchMetadata",
     "DispatchRecord",
+    "DispatchHandle",
+    "CombineEvents",
     "DistributedReferenceResult",
     "ElasticExpertTopology",
     "ExpertBatch",
     "ExpertOutput",
+    "GenerationChangeState",
+    "GenerationCommit",
+    "GenerationDrain",
+    "GENERATION_REBASE_PLANES",
+    "HandleState",
+    "MoEPipeline",
     "PeerSlab",
     "PeerSlabLayout",
+    "PipelineBackend",
+    "PipelineBankBuffers",
+    "PipelineError",
+    "PipelineFailed",
     "PipelineLLArenaLayout",
+    "PipelineState",
     "RecordLocation",
     "RoutingPlan",
     "SlabPreamble",
+    "StagedGeneration",
     "StableSparseTopology",
+    "AbruptPeerLoss",
     "align_up",
     "distributed_moe_reference",
     "expert_transform",
