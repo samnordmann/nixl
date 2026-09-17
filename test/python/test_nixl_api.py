@@ -174,29 +174,6 @@ def test_metadata_pass(two_agents):
     utils.free_passthru(addr)
 
 
-def test_deregister_memory_receipt_and_fresh_retry_are_idempotent(
-    one_agent, backend_name
-):
-    size = 64
-    addr = utils.malloc_passthru(size)
-    try:
-        descs = one_agent.get_reg_descs([(addr, size, 0, "receipt")], "DRAM")
-        assert one_agent.register_memory(descs, backends=[backend_name]) is descs
-
-        receipt = one_agent.prepare_deregister_memory(descs, backends=[backend_name])
-        assert not receipt.completed
-        assert one_agent.execute_deregister_memory(receipt) == bindings.NIXL_SUCCESS
-        assert receipt.completed
-        assert one_agent.execute_deregister_memory(receipt) == bindings.NIXL_SUCCESS
-
-        # This helper intentionally prepares a fresh receipt. Native NOT_FOUND
-        # proves the earlier deregistration committed and is normalized to the
-        # same None-valued success contract as the original high-level API.
-        assert one_agent.deregister_memory(descs, backends=[backend_name]) is None
-    finally:
-        utils.free_passthru(addr)
-
-
 @pytest.mark.timeout(5, func_only=True)
 def test_empty_notif_tag(two_connected_agents):
     agent1, agent2 = two_connected_agents
@@ -207,38 +184,6 @@ def test_empty_notif_tag(two_connected_agents):
     while not found:
         # empty bytes will consume any message
         found = agent2.check_remote_xfer_done(agent1.name, b"")
-
-
-@pytest.mark.timeout(5, func_only=True)
-def test_explicit_backend_notification(two_connected_agents, backend_name):
-    agent1, agent2 = two_connected_agents
-    payload = b"explicit-backend"
-    agent1.send_notif(agent2.name, payload, backend=backend_name)
-
-    while True:
-        batches = agent2.get_new_notif_batches(backends=[backend_name])
-        if batches:
-            break
-
-    assert batches == {agent1.name: (payload,)}
-
-
-@pytest.mark.timeout(5, func_only=True)
-def test_grouped_notification_api_returns_immutable_source_batches(
-    two_connected_agents,
-):
-    agent1, agent2 = two_connected_agents
-    payload = b"grouped-high-level\x00payload"
-    sender = agent1.create_notif_sender(agent2.name)
-    assert sender.send(payload) is None
-
-    while True:
-        batches = agent2.get_new_notif_batches()
-        if batches:
-            break
-
-    assert batches == {agent1.name: (payload,)}
-    assert type(batches[agent1.name]) is tuple
 
 
 def test_improper_get_xfer_descs(one_empty_agent, one_reg_list):

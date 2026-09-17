@@ -53,18 +53,6 @@ class nixlAgent {
          */
         ~nixlAgent ();
 
-        /**
-         * @brief Return the immutable synchronization mode retained by this agent.
-         *
-         * This is the effective agent-lock mode after construction-time safety
-         * upgrades. In particular, a requested NIXL_THREAD_SYNC_NONE is reported
-         * as NIXL_THREAD_SYNC_STRICT when a metadata backend starts a worker thread.
-         *
-         * @return nixl_thread_sync_t Effective synchronization mode
-         */
-        [[nodiscard]] nixl_thread_sync_t
-        getEffectiveSyncMode () const noexcept;
-
         /* It is unsafe to move nixlAgent object */
         nixlAgent(nixlAgent&&) noexcept = delete;
         nixlAgent &operator=(nixlAgent&&) noexcept = delete;
@@ -105,21 +93,6 @@ class nixlAgent {
         getBackendParams (const nixlBackendH* backend,
                           nixl_mem_list_t &mems,
                           nixl_b_params_t &params) const;
-
-        /**
-         * @brief Resolve an agent-owned backend handle to its backend type.
-         *
-         * Pointer identity is checked against this agent's handle registry while
-         * holding the agent lock. The supplied pointer is never dereferenced
-         * unless it is owned by this exact agent.
-         *
-         * @param  backend       Candidate backend handle
-         * @param  type [out]    Backend type for an owned handle
-         * @return NIXL_SUCCESS for an owned handle, otherwise NIXL_ERR_INVALID_PARAM
-         */
-        nixl_status_t
-        getBackendType (const nixlBackendH* backend,
-                        nixl_backend_t &type) const;
 
         /**
          * @brief  Instantiate a backend engine object based on the corresponding parameters
@@ -546,17 +519,6 @@ class nixlAgent {
         nixl_status_t
         loadRemoteMD (const nixl_blob_t &remote_metadata,
                       std::string &agent_name);
-
-        /**
-         * @brief  Inspect a serialized metadata blob without mutating remote state.
-         *
-         * @param  remote_metadata  Serialized metadata blob to inspect
-         * @param  agent_name [out] Agent name encoded in the metadata blob
-         * @return nixl_status_t    Error code if the serialized identity prefix is malformed
-         */
-        nixl_status_t
-        inspectRemoteMD (const nixl_blob_t &remote_metadata,
-                         std::string &agent_name) const;
 
         /**
          * @brief  Invalidate the remote agent metadata cached locally. This will

@@ -16,8 +16,6 @@
  */
 #include <gtest/gtest.h>
 #include <algorithm>
-#include <cstring>
-#include <limits>
 #include <thread>
 #include <random>
 #include "nixl.h"
@@ -188,67 +186,6 @@ TEST_F(MetadataExchangeTestFixture, GetLocalAndLoadRemote) {
 
     // Remote does not exist so cannot invalidate
     ASSERT_NE(dst.agent->invalidateRemoteMD(src.name), NIXL_SUCCESS);
-}
-
-TEST_F(MetadataExchangeTestFixture, InspectRemoteDoesNotLoadMetadata) {
-    auto &src = agents_[0];
-    auto &dst = agents_[1];
-    src.initDefault();
-
-    nixl_blob_t metadata;
-    std::string remote_name;
-    ASSERT_EQ(src.agent->getLocalMD(metadata), NIXL_SUCCESS);
-    ASSERT_EQ(dst.agent->inspectRemoteMD(metadata, remote_name), NIXL_SUCCESS);
-    ASSERT_EQ(remote_name, src.name);
-    ASSERT_EQ(dst.agent->checkRemoteMD(src.name, {DRAM_SEG}), NIXL_ERR_NOT_FOUND);
-
-    ASSERT_EQ(dst.agent->inspectRemoteMD("invalid", remote_name), NIXL_ERR_MISMATCH);
-}
-
-TEST_F(MetadataExchangeTestFixture, InspectRemoteRejectsMalformedIdentityFraming) {
-    auto &src = agents_[0];
-    auto &dst = agents_[1];
-    src.initDefault();
-
-    nixl_blob_t metadata;
-    ASSERT_EQ(src.agent->getLocalMD(metadata), NIXL_SUCCESS);
-
-    constexpr size_t prefix_size = sizeof("nixlSerDes|") - 1;
-    constexpr size_t tag_size = sizeof("Agent") - 1;
-    const size_t length_offset = prefix_size + tag_size;
-    const size_t data_offset = length_offset + sizeof(size_t);
-    size_t encoded_length = 0;
-    ASSERT_GT(metadata.size(), data_offset);
-    std::memcpy(&encoded_length, metadata.data() + length_offset, sizeof(encoded_length));
-    ASSERT_LE(encoded_length, metadata.size() - data_offset - 1);
-    const size_t delimiter_offset = data_offset + encoded_length;
-    ASSERT_EQ(metadata[delimiter_offset], '|');
-
-    std::vector<nixl_blob_t> malformed;
-
-    nixl_blob_t corrupted_delimiter = metadata;
-    corrupted_delimiter[delimiter_offset] = '!';
-    malformed.push_back(std::move(corrupted_delimiter));
-
-    nixl_blob_t truncated_length = metadata;
-    truncated_length.resize(data_offset - 1);
-    malformed.push_back(std::move(truncated_length));
-
-    nixl_blob_t truncated_data = metadata;
-    truncated_data.resize(delimiter_offset);
-    malformed.push_back(std::move(truncated_data));
-
-    nixl_blob_t overflowing_length = metadata;
-    const size_t maximum = std::numeric_limits<size_t>::max();
-    std::memcpy(overflowing_length.data() + length_offset, &maximum, sizeof(maximum));
-    malformed.push_back(std::move(overflowing_length));
-
-    for (const auto &value : malformed) {
-        std::string output = "unchanged-on-failure";
-        EXPECT_EQ(dst.agent->inspectRemoteMD(value, output), NIXL_ERR_MISMATCH);
-        EXPECT_EQ(output, "unchanged-on-failure");
-        EXPECT_EQ(dst.agent->checkRemoteMD(src.name, {DRAM_SEG}), NIXL_ERR_NOT_FOUND);
-    }
 }
 
 TEST_F(MetadataExchangeTestFixture, LoadRemoteWithErrors) {

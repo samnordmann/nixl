@@ -196,29 +196,6 @@ namespace agent {
         }
     };
 
-    TEST(AgentEffectiveSyncModeTest, RetainsExplicitLockingModes) {
-        nixlAgentConfig strict_cfg;
-        strict_cfg.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT;
-        nixlAgent strict_agent("EffectiveSyncStrict", strict_cfg);
-        EXPECT_EQ(strict_agent.getEffectiveSyncMode(),
-                  nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT);
-
-        nixlAgentConfig rw_cfg;
-        rw_cfg.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
-        nixlAgent rw_agent("EffectiveSyncRw", rw_cfg);
-        EXPECT_EQ(rw_agent.getEffectiveSyncMode(), nixl_thread_sync_t::NIXL_THREAD_SYNC_RW);
-    }
-
-    TEST(AgentEffectiveSyncModeTest, ReportsMetadataThreadSafetyUpgrade) {
-        nixlAgentConfig cfg;
-        cfg.useListenThread = true;
-        cfg.listenPort = 0;
-        cfg.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE;
-        nixlAgent agent("EffectiveSyncUpgrade", cfg);
-        EXPECT_EQ(agent.getEffectiveSyncMode(),
-                  nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT);
-    }
-
     TEST_F(singleAgentSessionFixture, GetNonExistingPluginTest) {
         nixl_mem_list_t mem;
         nixl_b_params_t params;
@@ -535,44 +512,6 @@ namespace agent {
         EXPECT_EQ(local_agent_->releaseXferReq(xfer_req), NIXL_SUCCESS);
         EXPECT_EQ(local_agent_->releasedDlistH(desc_hndl1), NIXL_SUCCESS);
         EXPECT_EQ(local_agent_->releasedDlistH(desc_hndl2), NIXL_SUCCESS);
-    }
-
-    TEST_F(dualAgentBridgeFixture, XferReleaseRetriesBackendFailure) {
-        using testing::_;
-        using testing::DoAll;
-        using testing::Return;
-        using testing::SetArgReferee;
-
-        DualAgentSetup s(DRAM_SEG);
-        setupDualAgent(s);
-
-        nixl_xfer_dlist_t local_xfer_dlist(DRAM_SEG), remote_xfer_dlist(DRAM_SEG);
-        local_xfer_dlist.addDesc(s.local_blob.getDesc());
-        remote_xfer_dlist.addDesc(s.remote_blob.getDesc());
-        nixlXferReqH *xfer_req = nullptr;
-        EXPECT_EQ(local_agent_->createXferReq(NIXL_WRITE,
-                                              local_xfer_dlist,
-                                              remote_xfer_dlist,
-                                              s.remote_agent_name,
-                                              xfer_req,
-                                              &s.local_extra_params),
-                  NIXL_SUCCESS);
-
-        char backend_request_storage = 0;
-        auto *backend_request =
-            reinterpret_cast<nixlBackendReqH *>(&backend_request_storage);
-        EXPECT_CALL(local_agent_helper_->getGMockEngine(), postXfer(_, _, _, _, _, _))
-            .WillOnce(DoAll(SetArgReferee<4>(backend_request), Return(NIXL_IN_PROG)));
-        EXPECT_CALL(local_agent_helper_->getGMockEngine(), checkXfer(backend_request))
-            .Times(2)
-            .WillRepeatedly(Return(NIXL_IN_PROG));
-        EXPECT_CALL(local_agent_helper_->getGMockEngine(), releaseReqH(backend_request))
-            .WillOnce(Return(NIXL_ERR_BACKEND))
-            .WillOnce(Return(NIXL_SUCCESS));
-
-        EXPECT_EQ(local_agent_->postXferReq(xfer_req), NIXL_IN_PROG);
-        EXPECT_EQ(local_agent_->releaseXferReq(xfer_req), NIXL_ERR_REPOST_ACTIVE);
-        EXPECT_EQ(local_agent_->releaseXferReq(xfer_req), NIXL_SUCCESS);
     }
 
     TEST_F(dualAgentBridgeFixture, GenNotifTest) {

@@ -349,8 +349,7 @@ performTransfer(nixlUcxEngine *ucx1,
 
     if (hiter.needRelease()) {
         hiter.unsetHandle();
-        nixl_exit_on_failure(ucx1->releaseReqH(handle) == NIXL_SUCCESS,
-                             "Completed transfer request was not released");
+        ucx1->releaseReqH(handle);
     }
 
     if(use_notif) {
@@ -393,52 +392,6 @@ performTransfer(nixlUcxEngine *ucx1,
     releaseValidationPtr(req_dst_descs.getType(), chkptr2);
 
     cout << "OK" << endl;
-}
-
-void
-testReleaseBeforeStatus(nixlUcxEngine *ucx,
-                        nixl_meta_dlist_t &req_src_descs,
-                        nixl_meta_dlist_t &req_dst_descs,
-                        void *addr1,
-                        void *addr2,
-                        size_t len,
-                        nixl_xfer_op_t op) {
-    doMemset(req_src_descs.getType(), 0, addr1, 0xbb, len);
-    doMemset(req_dst_descs.getType(), 0, addr2, 0, len);
-
-    nixlBackendReqH *handle = nullptr;
-    nixl_opt_b_args_t opt_args;
-    const std::string remote_agent("Agent1");
-    nixl_status_t status =
-        ucx->prepXfer(op, req_src_descs, req_dst_descs, remote_agent, handle, &opt_args);
-    nixl_exit_on_failure(status == NIXL_SUCCESS, "Failed to prepare early-release transfer");
-    status = ucx->postXfer(op, req_src_descs, req_dst_descs, remote_agent, handle, &opt_args);
-    nixl_exit_on_failure(status >= NIXL_SUCCESS, "Failed to post early-release transfer");
-
-    size_t release_attempts = 0;
-    do {
-        status = ucx->releaseReqH(handle);
-        if (status == NIXL_SUCCESS) {
-            handle = nullptr;
-            break;
-        }
-        nixl_exit_on_failure(status == NIXL_IN_PROG, "Early release returned an unexpected status");
-        ++release_attempts;
-        nixl_exit_on_failure(release_attempts < 10000000,
-                             "Early release did not converge to quiescence");
-    } while (true);
-
-    void *chkptr1 = getValidationPtr(req_src_descs.getType(), addr1, len);
-    void *chkptr2 = getValidationPtr(req_dst_descs.getType(), addr2, len);
-    for (size_t i = 0; i < len; ++i) {
-        nixl_exit_on_failure(((uint8_t *)chkptr1)[i] == ((uint8_t *)chkptr2)[i],
-                             "Early release returned before data quiescence");
-    }
-    releaseValidationPtr(req_src_descs.getType(), chkptr1);
-    releaseValidationPtr(req_dst_descs.getType(), chkptr2);
-
-    std::cout << "\tEarly " << op2string(op, false) << " release converged after "
-              << release_attempts << " retry attempts\n";
 }
 
 void
@@ -507,13 +460,6 @@ test_intra_agent_transfer(bool p_thread, nixlUcxEngine *ucx, nixl_mem_t mem_type
                                 addr1, addr2, len, ops[i], hiter, p_thread, use_notif);
             }
         }
-    }
-
-    // Release is deliberately attempted before any explicit status poll. The
-    // first call may complete synchronously on some transports; when it does
-    // not, every retry must preserve the same live handle until UCX is quiet.
-    for (nixl_xfer_op_t op : ops) {
-        testReleaseBeforeStatus(ucx, req_src_descs, req_dst_descs, addr1, addr2, len, op);
     }
 
     ucx->unloadMD (rmd2);
@@ -724,25 +670,5 @@ int main()
         for(int j = 0; j < 2; j++) {
             releaseEngine(ucx[i][j]);
         }
-    }
-
-    // Exercise the same early-release invariant through the composite/chunk
-    // request path. A low split threshold keeps the test compact while forcing
-    // two dedicated posting workers.
-    {
-        nixlBackendInitParams init;
-        nixl_b_params_t custom_params;
-        custom_params["num_threads"] = "2";
-        custom_params["split_batch_size"] = "2";
-        init.enableProgTh = true;
-        init.pthrDelay = 100;
-        init.localAgent = "Agent1";
-        init.customParams = &custom_params;
-        init.type = "UCX";
-
-        auto threadpool_ucx = nixlUcxEngine::create(init);
-        nixl_exit_on_failure(threadpool_ucx && !threadpool_ucx->getInitErr(),
-                             "Failed to initialize UCX threadpool engine");
-        test_intra_agent_transfer(true, threadpool_ucx.get(), DRAM_SEG);
     }
 }

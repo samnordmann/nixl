@@ -44,9 +44,6 @@ class nixlAgentData final : public nixlMetadataContext {
         // Declared before `lock` because whether any backend runs a thread is
         // what decides the effective sync mode.
         nixlMDManager md_;
-        // Retain the exact construction-time decision both for the lock and
-        // read-only public introspection. It never changes after construction.
-        const nixl_thread_sync_t effectiveSyncMode_;
         nixlLock        lock;
         std::atomic<bool> efaWarningChecked = false;
 
