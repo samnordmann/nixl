@@ -64,6 +64,20 @@ nixlGpuGetXferStatus(nixlGpuXferStatusH &xfer_status) {
     return nixl::gpu::getXferStatus<level>(xfer_status);
 }
 
+/**
+ * Submit a device PUT.
+ *
+ * With a non-null transfer-status handle, an accepted operation returns
+ * NIXL_SUCCESS when it completed synchronously or NIXL_IN_PROG when the caller
+ * must poll nixlGpuGetXferStatus(). With a null handle, accepted requestless
+ * posts return NIXL_IN_PROG because local completion is intentionally not
+ * tracked. Errors are negative in both forms.
+ *
+ * A mixed remote memory view may contain NIXL_NULL_AGENT gap elements for
+ * low-level compatibility. A gap is not a transport endpoint and must never
+ * be passed as dst. Probe it with nixlGetPtr(), which returns nullptr for a
+ * gap, and omit the transfer instead.
+ */
 template<nixl_gpu_level_t level = nixl_gpu_level_t::THREAD>
 __device__ nixl_status_t
 nixlPut(const nixlMemViewElem &src,
@@ -75,6 +89,11 @@ nixlPut(const nixlMemViewElem &src,
     return nixl::gpu::put<level>(src, dst, size, channel_id, flags, xfer_status);
 }
 
+/**
+ * Submission/completion semantics match nixlPut(). A NIXL_NULL_AGENT gap is
+ * not a counter endpoint and must never be passed to this operation; use
+ * nixlGetPtr() to detect and omit gaps first.
+ */
 template<nixl_gpu_level_t level = nixl_gpu_level_t::THREAD>
 __device__ nixl_status_t
 nixlAtomicAdd(uint64_t value,

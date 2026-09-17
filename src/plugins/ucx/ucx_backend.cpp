@@ -26,6 +26,9 @@
 #include <optional>
 #include <limits>
 #include <future>
+#include <charconv>
+#include <stdexcept>
+#include <string_view>
 #include <string.h>
 #include <unistd.h>
 #include "absl/strings/numbers.h"
@@ -46,6 +49,66 @@ sglEnabledFromConfig() {
     }
     return false;
 #endif
+}
+
+[[nodiscard]] std::optional<uint64_t>
+deviceUnsignedOption(const nixl_opt_b_args_t *opt_args, std::string_view name) {
+    if (!opt_args) {
+        return std::nullopt;
+    }
+
+    const std::string key{std::string{name} + "="};
+    size_t pos = 0;
+    do {
+        pos = opt_args->customParam.find(key, pos);
+        if (pos == std::string::npos) {
+            return std::nullopt;
+        }
+        if ((pos == 0) || (opt_args->customParam[pos - 1] == ';')) {
+            break;
+        }
+        pos += key.size();
+    } while (true);
+
+    const size_t value_begin = pos + key.size();
+    const size_t value_end = opt_args->customParam.find(';', value_begin);
+    const std::string_view value{opt_args->customParam.data() + value_begin,
+                                 (value_end == std::string::npos
+                                      ? opt_args->customParam.size()
+                                      : value_end) -
+                                     value_begin};
+    uint64_t parsed{0};
+    const auto [end, error] = std::from_chars(value.begin(), value.end(), parsed);
+    if ((value.empty()) || (error != std::errc{}) || (end != value.end())) {
+        throw std::invalid_argument(std::string{name} + " must be an unsigned integer");
+    }
+
+    if (value_end != std::string::npos) {
+        size_t next = value_end + 1;
+        while ((next = opt_args->customParam.find(key, next)) != std::string::npos) {
+            if ((next == 0) || (opt_args->customParam[next - 1] == ';')) {
+                throw std::invalid_argument(std::string{name} + " must not be repeated");
+            }
+            next += key.size();
+        }
+    }
+    return parsed;
+}
+
+[[nodiscard]] std::optional<std::chrono::milliseconds>
+deviceConnectionTimeout(const nixl_opt_b_args_t *opt_args) {
+    const auto timeout_ms = deviceUnsignedOption(opt_args, "connection_timeout_ms");
+    if (!timeout_ms) {
+        return std::nullopt;
+    }
+
+    if ((*timeout_ms == 0) ||
+        (*timeout_ms > static_cast<uint64_t>(
+                          std::chrono::milliseconds::max().count()))) {
+        throw std::invalid_argument("connection_timeout_ms must be a positive integer");
+    }
+
+    return std::chrono::milliseconds{*timeout_ms};
 }
 } // namespace
 
@@ -1468,10 +1531,27 @@ nixl_status_t
 nixlUcxEngine::prepMemView(const nixl_remote_meta_dlist_t &dlist,
                            nixlMemViewH &mvh,
                            const nixl_opt_b_args_t *opt_args) const {
-    const size_t worker_id = getSharedWorkerId(opt_args);
     try {
-        mvh = nixl::ucx::createMemList(dlist, *getSharedWorker(worker_id));
+        size_t worker_id;
+        if (const auto requested_worker = deviceUnsignedOption(opt_args, "worker_id")) {
+            if ((*requested_worker > std::numeric_limits<size_t>::max()) ||
+                (*requested_worker >= getSharedWorkersSize())) {
+                NIXL_ERROR << "Invalid worker_id " << *requested_worker << " (must be < "
+                           << getSharedWorkersSize() << ")";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            worker_id = static_cast<size_t>(*requested_worker);
+        } else {
+            worker_id = getSharedWorkerId();
+        }
+
+        mvh = nixl::ucx::createMemList(
+            dlist, *getSharedWorker(worker_id), deviceConnectionTimeout(opt_args));
         return NIXL_SUCCESS;
+    }
+    catch (const std::invalid_argument &e) {
+        NIXL_ERROR << "Invalid remote memory-view parameters: " << e.what();
+        return NIXL_ERR_INVALID_PARAM;
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "Failed to prepare remote memory view: " << e.what();
@@ -1483,10 +1563,26 @@ nixl_status_t
 nixlUcxEngine::prepMemView(const nixl_meta_dlist_t &dlist,
                            nixlMemViewH &mvh,
                            const nixl_opt_b_args_t *opt_args) const {
-    const size_t worker_id = getSharedWorkerId(opt_args);
     try {
+        size_t worker_id;
+        if (const auto requested_worker = deviceUnsignedOption(opt_args, "worker_id")) {
+            if ((*requested_worker > std::numeric_limits<size_t>::max()) ||
+                (*requested_worker >= getSharedWorkersSize())) {
+                NIXL_ERROR << "Invalid worker_id " << *requested_worker << " (must be < "
+                           << getSharedWorkersSize() << ")";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            worker_id = static_cast<size_t>(*requested_worker);
+        } else {
+            worker_id = getSharedWorkerId();
+        }
+
         mvh = nixl::ucx::createMemList(dlist, *getSharedWorker(worker_id));
         return NIXL_SUCCESS;
+    }
+    catch (const std::invalid_argument &e) {
+        NIXL_ERROR << "Invalid local memory-view parameters: " << e.what();
+        return NIXL_ERR_INVALID_PARAM;
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "Failed to prepare local memory view: " << e.what();

@@ -30,6 +30,16 @@
 
 using backend_list_t = std::vector<nixlBackendEngine*>;
 
+// Cache membership and imported metadata have different lifetimes. CPU handles
+// weakly reference this registration, which expires on cache eviction. GPU views
+// retain only its section so backend metadata survives until releaseMemView().
+struct nixlRemoteRegistration {
+    explicit nixlRemoteRegistration(const std::string &name)
+        : section(std::make_shared<nixlRemoteSection>(name)) {}
+
+    const std::shared_ptr<nixlRemoteSection> section;
+};
+
 // Implements nixlMetadataContext, which is the whole surface a metadata backend
 // sees of the agent: serialization, cache load and invalidation, nothing else.
 // Preserve the grandfathered 8-space class layout below.
@@ -54,9 +64,6 @@ class nixlAgentData final : public nixlMetadataContext {
         backend_list_t                         notifEngines;
         std::array<backend_list_t, FILE_SEG+1> memToBackend;
 
-        // Bookkeeping from memory view handles to backend engines
-        std::unordered_map<nixlMemViewH, nixlBackendEngine &> mvhToEngine;
-
         std::unordered_map<std::string, std::unordered_map<nixl_backend_t, nixl_blob_t>>
             remoteBackends_;
 
@@ -65,9 +72,20 @@ class nixlAgentData final : public nixlMetadataContext {
         std::unordered_map<nixl_backend_t, std::unique_ptr<nixlBackendH>> backendHandles_;
         std::unordered_map<nixl_backend_t, nixl_blob_t> connMd_;
         backend_map_t backendEngines_;
-        // Owning shared_ptr per registration generation; weak refs in handles expire on
-        // invalidation or re-registration.
-        std::unordered_map<std::string, std::shared_ptr<nixlRemoteSection>> remoteSections_;
+        // Erasing a registration expires CPU handles even if a GPU view retains its section.
+        std::unordered_map<std::string, std::shared_ptr<nixlRemoteRegistration>> remoteSections_;
+
+        struct MemViewState {
+            nixlBackendEngine *engine;
+            // A remote section owns its backend metadata. For UCX that metadata owns the
+            // connection whose endpoint is embedded in the device memory-list handle.
+            // Keep the exact generations used by this view alive through releaseMemView().
+            std::vector<std::shared_ptr<nixlRemoteSection>> remoteSections;
+        };
+        // Declared after remoteSections_ and backendEngines_ so these strong references are
+        // destroyed first while their backend engines are still alive.
+        std::unordered_map<nixlMemViewH, MemViewState> memViews_;
+
         std::unique_ptr<nixlTelemetry> telemetry_;
         // Composite tracer (fans out to every enabled backend); null when no
         // backend is active.
@@ -95,10 +113,14 @@ class nixlAgentData final : public nixlMetadataContext {
                      const nixl_blob_t &conn_info);
         nixl_status_t
         loadRemoteSections(const std::string &remote_name, nixlSerDes &sd);
-        [[nodiscard]] static backend_set_t
+        [[nodiscard]] nixl_status_t
+        resolveBackendHandle(const nixlBackendH *requested_backend,
+                             nixlBackendEngine *&backend);
+        [[nodiscard]] nixl_status_t
         getBackends(const nixl_opt_args_t *opt_args,
                     const nixlMemSection &section,
-                    nixl_mem_t mem_type);
+                    nixl_mem_t mem_type,
+                    backend_set_t &backends);
         void
         warnAboutEfaHardwareMismatch();
 

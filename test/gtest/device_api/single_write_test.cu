@@ -18,6 +18,7 @@
 #include "utils.cuh"
 #include "common.h"
 
+#include <algorithm>
 #include <memory>
 #include <gtest/gtest.h>
 
@@ -37,7 +38,7 @@ putKernel(putParams put_params,
           unsigned long long *start_time,
           unsigned long long *end_time) {
     __shared__ nixlGpuXferStatusH xfer_statuses[MAX_THREADS];
-    nixlGpuXferStatusH xfer_status = xfer_statuses[GetReqIdx<level>()];
+    nixlGpuXferStatusH &xfer_status = xfer_statuses[GetReqIdx<level>()];
 
     assert(GetReqIdx<level>() < MAX_THREADS);
 
@@ -54,7 +55,7 @@ putKernel(putParams put_params,
                                      put_params.channelId,
                                      put_params.flags,
                                      &xfer_status);
-        if (status != NIXL_IN_PROG) {
+        if ((status != NIXL_SUCCESS) && (status != NIXL_IN_PROG)) {
             printf("Thread %d: nixlPut failed iteration %zu: status=%d (0x%x)\n",
                    threadIdx.x,
                    i,
@@ -63,9 +64,9 @@ putKernel(putParams put_params,
             return;
         }
 
-        do {
+        while (status == NIXL_IN_PROG) {
             status = nixlGpuGetXferStatus<level>(xfer_status);
-        } while (status == NIXL_IN_PROG);
+        }
 
         if (status != NIXL_SUCCESS) {
             printf("Thread %d: Transfer completion failed iteration %zu: status=%d\n",
@@ -499,6 +500,62 @@ TEST_P(SingleWriteTest, MultipleWorkersPut) {
     invalidateMD();
 }
 
+TEST_P(SingleWriteTest, SingleWorkerPutSubranges) {
+    std::vector<MemBuffer> src_buffers, dst_buffers;
+    constexpr size_t size = 4096;
+    createRegisteredMem(getAgent(SENDER_AGENT), size, 1, VRAM_SEG, src_buffers);
+    createRegisteredMem(getAgent(RECEIVER_AGENT), size, 1, VRAM_SEG, dst_buffers);
+    auto *src = static_cast<uint32_t *>(static_cast<void *>(src_buffers[0]));
+    auto *dst = static_cast<uint32_t *>(static_cast<void *>(dst_buffers[0]));
+    std::vector<uint32_t> source(size / sizeof(uint32_t));
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = 0xBEEF0000u + static_cast<uint32_t>(i);
+    }
+    std::vector<uint32_t> expected(source.size(), 0xA5A5A5A5u);
+    ASSERT_EQ(cudaMemcpy(src, source.data(), size, cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(dst, expected.data(), size, cudaMemcpyHostToDevice), cudaSuccess);
+    exchangeMD(SENDER_AGENT, RECEIVER_AGENT);
+
+    // Two distinct descriptors share one registration. Index selection and
+    // transfer offsets must both be relative to each descriptor, not to memh.
+    const auto src_registration = makeDescList<nixlBasicDesc>(src_buffers, VRAM_SEG);
+    const auto dst_registration = makeDescList<nixlBasicDesc>(dst_buffers, VRAM_SEG);
+    constexpr size_t src_bases[]{128, 2304};
+    constexpr size_t dst_bases[]{320, 2560};
+    constexpr size_t src_offsets[]{16, 32};
+    constexpr size_t dst_offsets[]{48, 64};
+    constexpr size_t lengths[]{256, 320};
+    nixl_local_dlist_t local_descs(VRAM_SEG);
+    nixl_remote_dlist_t remote_descs(VRAM_SEG);
+    for (size_t i = 0; i < 2; ++i) {
+        local_descs.addDesc(nixlBasicDesc(src_registration[0].addr + src_bases[i],
+                                         512, src_registration[0].devId));
+        remote_descs.addDesc(nixlRemoteDesc(
+            nixlBasicDesc(dst_registration[0].addr + dst_bases[i],
+                          512, dst_registration[0].devId),
+            getAgentName(RECEIVER_AGENT)));
+    }
+    nixlMemViewH local_view = nullptr, remote_view = nullptr;
+    ASSERT_EQ(getAgent(SENDER_AGENT).prepMemView(local_descs, local_view), NIXL_SUCCESS);
+    ASSERT_EQ(getAgent(SENDER_AGENT).prepMemView(remote_descs, remote_view), NIXL_SUCCESS);
+    for (size_t i = 0; i < 2; ++i) {
+        const putParams params{{local_view, i, src_offsets[i]},
+                               {remote_view, i, dst_offsets[i]}, lengths[i]};
+        ASSERT_EQ(dispatchLaunchPutKernel(GetParam(), params, 1), NIXL_SUCCESS);
+        std::copy_n(source.begin() + (src_bases[i] + src_offsets[i]) / sizeof(uint32_t),
+                    lengths[i] / sizeof(uint32_t),
+                    expected.begin() + (dst_bases[i] + dst_offsets[i]) / sizeof(uint32_t));
+    }
+    std::vector<uint32_t> actual(source.size());
+    ASSERT_EQ(cudaMemcpy(actual.data(), dst, size, cudaMemcpyDeviceToHost), cudaSuccess);
+    const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+    EXPECT_EQ(mismatch.first, actual.end())
+        << "First incorrect destination word: " << std::distance(actual.begin(), mismatch.first);
+    getAgent(SENDER_AGENT).releaseMemView(remote_view);
+    getAgent(SENDER_AGENT).releaseMemView(local_view);
+    invalidateMD();
+}
+
 TEST_P(SingleWriteTest, SingleWorkerPutGap) {
     std::vector<MemBuffer> src_buffers, dst_buffers;
     constexpr size_t size = 4 * 1024;
@@ -533,9 +590,13 @@ TEST_P(SingleWriteTest, SingleWorkerPutGap) {
     status = dispatchLaunchPutKernel(GetParam(), put_params, num_iters, &gpu_timer);
     ASSERT_EQ(status, NIXL_SUCCESS);
 
-    void *ptr;
-    getPtrKernel<<<1, 1>>>(dst_mvh, 0, &ptr);
-    ASSERT_NE(ptr, nullptr);
+    gpuVar<void *> active_ptr;
+    gpuVar<void *> gap_ptr;
+    getPtrKernel<<<1, 1>>>(dst_mvh, 0, active_ptr.get());
+    getPtrKernel<<<1, 1>>>(dst_mvh, 1, gap_ptr.get());
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_NE(*active_ptr, nullptr);
+    ASSERT_EQ(*gap_ptr, nullptr);
 
     logResultsPublic(size, count, num_iters, *gpu_timer.start_, *gpu_timer.end_);
 

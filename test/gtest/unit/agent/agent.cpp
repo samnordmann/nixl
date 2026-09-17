@@ -88,6 +88,11 @@ namespace agent {
             return agent_.get();
         }
 
+        mocks::GMockBackendEngine &
+        getGMockEngine() {
+            return gmock_engine_;
+        }
+
         const mocks::GMockBackendEngine &
         getGMockEngine() const {
             return gmock_engine_;
@@ -440,9 +445,369 @@ namespace agent {
         nixl_remote_dlist_t remote_dlist(DRAM_SEG);
         remote_dlist.addDesc(nixlRemoteDesc(s.remote_blob.getDesc(), s.remote_agent_name));
 
+        nixl_opt_args_t prep_params;
+        prep_params.backends.push_back(s.local_backend);
+        nixlMemViewH mvh = nullptr;
+        EXPECT_EQ(local_agent_->prepMemView(remote_dlist, mvh, &prep_params), NIXL_SUCCESS);
+        EXPECT_NE(mvh, nullptr);
+
+        local_agent_->releaseMemView(mvh);
+    }
+
+    TEST_F(singleAgentSessionFixture, PrepMemViewLocalRejectsInvalidBackendHandles) {
+        nixl_b_params_t params;
+        nixlBackendH *backend;
+        ASSERT_EQ(agent_helper_->createBackendWithGMock(params, backend), NIXL_SUCCESS);
+
+        blob local_blob;
+        nixl_reg_dlist_t reg_dlist(DRAM_SEG);
+        nixl_opt_args_t reg_params;
+        ASSERT_EQ(agent_helper_->initAndRegisterMemory(
+                      local_blob, reg_dlist, reg_params, backend),
+                  NIXL_SUCCESS);
+
+        nixl_local_dlist_t local_dlist(DRAM_SEG);
+        local_dlist.addDesc(local_blob.getDesc());
+        nixlMemViewH mvh = nullptr;
+
+        nixl_opt_args_t prep_params;
+        prep_params.backends.push_back(nullptr);
+        EXPECT_EQ(agent_->prepMemView(local_dlist, mvh, &prep_params),
+                  NIXL_ERR_INVALID_PARAM);
+
+        nixlBackendH *stale_backend = nullptr;
+        {
+            agentHelper stale_agent_helper("StaleAgent");
+            nixl_b_params_t stale_params;
+            ASSERT_EQ(stale_agent_helper.createBackendWithGMock(stale_params, stale_backend),
+                      NIXL_SUCCESS);
+        }
+
+        prep_params.backends = {stale_backend};
+        EXPECT_EQ(agent_->prepMemView(local_dlist, mvh, &prep_params),
+                  NIXL_ERR_INVALID_PARAM);
+    }
+
+    TEST_F(dualAgentBridgeFixture, PrepMemViewRemoteRejectsForeignBackendHandle) {
+        DualAgentSetup s(DRAM_SEG);
+        setupDualAgent(s, /*register_local=*/false);
+
+        nixl_remote_dlist_t remote_dlist(DRAM_SEG);
+        remote_dlist.addDesc(nixlRemoteDesc(s.remote_blob.getDesc(), s.remote_agent_name));
+
+        EXPECT_CALL(local_agent_helper_->getGMockEngine(),
+                    prepMemView(testing::_, testing::_, testing::_))
+            .Times(0);
+
+        nixl_opt_args_t prep_params;
+        prep_params.backends.push_back(s.remote_backend);
+        nixlMemViewH mvh = nullptr;
+        EXPECT_EQ(local_agent_->prepMemView(remote_dlist, mvh, &prep_params),
+                  NIXL_ERR_INVALID_PARAM);
+    }
+
+    TEST_F(dualAgentBridgeFixture, PublicBackendHintsRejectForeignAndNullHandles) {
+        DualAgentSetup s(DRAM_SEG);
+        setupDualAgent(s);
+        ASSERT_NE(s.local_backend, nullptr);
+        ASSERT_NE(s.remote_backend, nullptr);
+
+        nixl_opt_args_t foreign_params;
+        foreign_params.backends.push_back(s.remote_backend);
+        nixl_opt_args_t null_params;
+        null_params.backends.push_back(nullptr);
+
+        nixl_mem_list_t mems;
+        nixl_b_params_t params;
+        EXPECT_EQ(local_agent_->getBackendParams(s.remote_backend, mems, params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->getBackendParams(nullptr, mems, params), NIXL_ERR_INVALID_PARAM);
+
+        std::vector<nixl_query_resp_t> query_resp;
+        EXPECT_EQ(local_agent_->queryMem(s.local_reg_dlist, query_resp, &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->queryMem(s.local_reg_dlist, query_resp, &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+
+        blob unregistered_blob;
+        nixl_reg_dlist_t unregistered_dlist(DRAM_SEG);
+        unregistered_dlist.addDesc(unregistered_blob.getDesc());
+        EXPECT_EQ(local_agent_->registerMem(unregistered_dlist, &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->registerMem(unregistered_dlist, &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->deregisterMem(s.local_reg_dlist, &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->deregisterMem(s.local_reg_dlist, &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+
+        EXPECT_EQ(local_agent_->makeConnection(s.remote_agent_name, &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->makeConnection(s.remote_agent_name, &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+
+        nixl_xfer_dlist_t local_xfer_dlist(DRAM_SEG), remote_xfer_dlist(DRAM_SEG);
+        local_xfer_dlist.addDesc(s.local_blob.getDesc());
+        remote_xfer_dlist.addDesc(s.remote_blob.getDesc());
+
+        nixlDlistH *invalid_dlist = nullptr;
+        EXPECT_EQ(local_agent_->prepXferDlist(
+                      local_xfer_dlist, invalid_dlist, &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(invalid_dlist, nullptr);
+        EXPECT_EQ(local_agent_->prepXferDlist(local_xfer_dlist, invalid_dlist, &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(invalid_dlist, nullptr);
+
+        nixlXferReqH *invalid_req = nullptr;
+        EXPECT_EQ(local_agent_->createXferReq(NIXL_WRITE,
+                                              local_xfer_dlist,
+                                              remote_xfer_dlist,
+                                              s.remote_agent_name,
+                                              invalid_req,
+                                              &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(invalid_req, nullptr);
+        EXPECT_EQ(local_agent_->createXferReq(NIXL_WRITE,
+                                              local_xfer_dlist,
+                                              remote_xfer_dlist,
+                                              s.remote_agent_name,
+                                              invalid_req,
+                                              &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(invalid_req, nullptr);
+
+        nixlDlistH *local_dlist = nullptr;
+        nixlDlistH *remote_dlist = nullptr;
+        ASSERT_EQ(local_agent_->prepXferDlist(local_xfer_dlist, local_dlist), NIXL_SUCCESS);
+        ASSERT_EQ(local_agent_->prepXferDlist(
+                      s.remote_agent_name, remote_xfer_dlist, remote_dlist),
+                  NIXL_SUCCESS);
+        const std::vector<int> indices{0};
+        EXPECT_EQ(local_agent_->makeXferReq(NIXL_WRITE,
+                                            *local_dlist,
+                                            indices,
+                                            *remote_dlist,
+                                            indices,
+                                            invalid_req,
+                                            &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(invalid_req, nullptr);
+        EXPECT_EQ(local_agent_->makeXferReq(NIXL_WRITE,
+                                            *local_dlist,
+                                            indices,
+                                            *remote_dlist,
+                                            indices,
+                                            invalid_req,
+                                            &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(invalid_req, nullptr);
+        EXPECT_EQ(local_agent_->releasedDlistH(local_dlist), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->releasedDlistH(remote_dlist), NIXL_SUCCESS);
+
+        nixl_notifs_t notif_map;
+        EXPECT_EQ(local_agent_->getNotifs(notif_map, &foreign_params), NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->getNotifs(notif_map, &null_params), NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->genNotif(s.remote_agent_name, "message", &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->genNotif(s.remote_agent_name, "message", &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+
+        nixl_blob_t partial_md;
+        EXPECT_EQ(local_agent_->getLocalPartialMD(
+                      s.local_reg_dlist, partial_md, &foreign_params),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->getLocalPartialMD(s.local_reg_dlist, partial_md, &null_params),
+                  NIXL_ERR_INVALID_PARAM);
+    }
+
+    TEST_F(singleAgentSessionFixture, PrepMemViewRejectsNullAgentOnly) {
+        nixl_b_params_t params;
+        nixlBackendH *backend;
+        ASSERT_EQ(agent_helper_->createBackendWithGMock(params, backend), NIXL_SUCCESS);
+
+        blob first_blob, second_blob;
+        nixl_remote_dlist_t remote_dlist(DRAM_SEG);
+        remote_dlist.addDesc(nixlRemoteDesc(first_blob.getDesc(), nixl_null_agent));
+        remote_dlist.addDesc(nixlRemoteDesc(second_blob.getDesc(), nixl_null_agent));
+
+        EXPECT_CALL(agent_helper_->getGMockEngine(),
+                    prepMemView(testing::_, testing::_, testing::_))
+            .Times(0);
+
+        nixl_opt_args_t extra_params;
+        extra_params.backends.push_back(backend);
+        nixlMemViewH mvh = nullptr;
+        EXPECT_EQ(agent_->prepMemView(remote_dlist, mvh), NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(agent_->prepMemView(remote_dlist, mvh, &extra_params),
+                  NIXL_ERR_INVALID_PARAM);
+    }
+
+    TEST_F(dualAgentBridgeFixture, RemoteMemViewRetainsInvalidatedMetadataUntilRelease) {
+        DualAgentSetup s(DRAM_SEG);
+        setupDualAgent(s, /*register_local=*/false);
+
+        nixl_remote_dlist_t remote_dlist(DRAM_SEG);
+        remote_dlist.addDesc(nixlRemoteDesc(s.remote_blob.getDesc(), s.remote_agent_name));
+
+        nixlMemViewH mvh = nullptr;
+        ASSERT_EQ(local_agent_->prepMemView(remote_dlist, mvh), NIXL_SUCCESS);
+        ASSERT_NE(mvh, nullptr);
+
+        auto &engine = local_agent_helper_->getGMockEngine();
+        testing::InSequence lifetime_sequence;
+        EXPECT_CALL(engine, disconnect(s.remote_agent_name)).Times(1);
+        EXPECT_CALL(engine, loadRemoteConnInfo(s.remote_agent_name, testing::_)).Times(1);
+        EXPECT_CALL(engine, loadRemoteMD(testing::_, DRAM_SEG, s.remote_agent_name, testing::_))
+            .Times(1);
+        EXPECT_CALL(engine, unloadMD(testing::_)).Times(2);
+        EXPECT_CALL(engine, disconnect(s.remote_agent_name)).Times(1);
+
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(s.remote_agent_name), NIXL_SUCCESS);
+
+        // A replacement generation can be connected and loaded while the old view retains
+        // its own metadata and endpoint generation.
+        std::string reloaded_agent_name;
+        EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, reloaded_agent_name),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(reloaded_agent_name, s.remote_agent_name);
+
+        local_agent_->releaseMemView(mvh);
+        // Evict the replacement too, so both old and new generations are destroyed under
+        // the ordered expectations rather than during fixture teardown.
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(s.remote_agent_name), NIXL_SUCCESS);
+    }
+
+    class retainedMemViewInvalidationFixture : public dualAgentBridgeFixture,
+                                              public testing::WithParamInterface<bool> {};
+
+    TEST_P(retainedMemViewInvalidationFixture, RejectsStaleCpuHandles) {
+        DualAgentSetup s(DRAM_SEG);
+        setupDualAgent(s);
+        auto &engine = local_agent_helper_->getGMockEngine();
+
+        nixl_remote_dlist_t view_descs(DRAM_SEG);
+        view_descs.addDesc(nixlRemoteDesc(s.remote_blob.getDesc(), s.remote_agent_name));
+        nixlMemViewH view = nullptr;
+        ASSERT_EQ(local_agent_->prepMemView(view_descs, view), NIXL_SUCCESS);
+        ASSERT_NE(view, nullptr);
+
+        nixl_xfer_dlist_t local_descs(DRAM_SEG), remote_descs(DRAM_SEG);
+        local_descs.addDesc(s.local_blob.getDesc());
+        remote_descs.addDesc(s.remote_blob.getDesc());
+        nixlDlistH *local_list = nullptr, *remote_list = nullptr;
+        ASSERT_EQ(local_agent_->prepXferDlist(local_descs, local_list), NIXL_SUCCESS);
+        ASSERT_EQ(local_agent_->prepXferDlist(s.remote_agent_name, remote_descs, remote_list),
+                  NIXL_SUCCESS);
+        nixlXferReqH *request = nullptr;
+        ASSERT_EQ(local_agent_->createXferReq(
+                      NIXL_WRITE, local_descs, remote_descs, s.remote_agent_name, request),
+                  NIXL_SUCCESS);
+
+        // An ordinary refresh merges metadata and must NOT expire existing handles.
+        std::string peer;
+        ASSERT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, peer), NIXL_SUCCESS);
+        EXPECT_CALL(engine, postXfer(testing::_, testing::_, testing::_, testing::_, testing::_,
+                                     testing::_))
+            .WillOnce(testing::Return(NIXL_IN_PROG));
+        ASSERT_EQ(local_agent_->postXferReq(request), NIXL_IN_PROG);
+        ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(&engine));
+
+        // Both explicit invalidation and a failed metadata merge evict a registration.
+        // Neither may unload metadata still owned by a GPU view.
+        EXPECT_CALL(engine, unloadMD(testing::_)).Times(0);
+        blob extra_blob;
+        if (GetParam()) {
+            nixl_reg_dlist_t extra_descs(DRAM_SEG);
+            extra_descs.addDesc(extra_blob.getDesc());
+            ASSERT_EQ(remote_agent_->registerMem(extra_descs, &s.remote_extra_params),
+                      NIXL_SUCCESS);
+            EXPECT_CALL(engine, loadRemoteMD(testing::_, DRAM_SEG, s.remote_agent_name,
+                                              testing::_))
+                .WillOnce(testing::Return(NIXL_ERR_BACKEND));
+            EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, peer),
+                      NIXL_ERR_BACKEND);
+        } else {
+            EXPECT_EQ(local_agent_->invalidateRemoteMD(s.remote_agent_name), NIXL_SUCCESS);
+        }
+
+        EXPECT_CALL(engine, postXfer(testing::_, testing::_, testing::_, testing::_, testing::_,
+                                     testing::_))
+            .Times(0);
+        EXPECT_CALL(engine, checkXfer(testing::_)).Times(0);
+        const std::vector<int> indices{0};
+        auto expect_stale = [&]() {
+            EXPECT_EQ(local_agent_->getXferStatus(request), NIXL_ERR_NOT_FOUND);
+            EXPECT_EQ(local_agent_->postXferReq(request), NIXL_ERR_NOT_FOUND);
+            std::chrono::microseconds duration{}, margin{};
+            nixl_cost_t method{};
+            EXPECT_EQ(local_agent_->estimateXferCost(request, duration, margin, method),
+                      NIXL_ERR_NOT_FOUND);
+            nixlXferReqH *stale_request = nullptr;
+            EXPECT_EQ(local_agent_->makeXferReq(NIXL_WRITE, *local_list, indices, *remote_list,
+                                                indices, stale_request),
+                      NIXL_ERR_NOT_FOUND);
+            EXPECT_EQ(stale_request, nullptr);
+            if (stale_request) {
+                EXPECT_EQ(local_agent_->releaseXferReq(stale_request), NIXL_SUCCESS);
+            }
+        };
+        expect_stale();
+        ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(&engine));
+
+        // Reloading the same name must not revive handles for its former generation.
+        ASSERT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, peer), NIXL_SUCCESS);
+        EXPECT_CALL(engine, postXfer(testing::_, testing::_, testing::_, testing::_, testing::_,
+                                     testing::_))
+            .Times(0);
+        EXPECT_CALL(engine, checkXfer(testing::_)).Times(0);
+        expect_stale();
+        ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(&engine));
+
+        nixlXferReqH *fresh_request = nullptr;
+        ASSERT_EQ(local_agent_->createXferReq(
+                      NIXL_WRITE, local_descs, remote_descs, peer, fresh_request),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->postXferReq(fresh_request), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->releaseXferReq(fresh_request), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->releaseXferReq(request), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->releasedDlistH(local_list), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->releasedDlistH(remote_list), NIXL_SUCCESS);
+        local_agent_->releaseMemView(view);
+    }
+
+    INSTANTIATE_TEST_SUITE_P(
+        RemoteMemView,
+        retainedMemViewInvalidationFixture,
+        testing::Bool(),
+        [](const testing::TestParamInfo<bool> &info) {
+            return info.param ? "FailedMetadataLoad" : "ExplicitInvalidation";
+        });
+
+    TEST_F(dualAgentBridgeFixture, PrepMemViewMixedNullAndRemoteSelectionIsUnchanged) {
+        DualAgentSetup s(DRAM_SEG);
+        setupDualAgent(s, /*register_local=*/false);
+
+        nixl_remote_dlist_t remote_dlist(DRAM_SEG);
+        remote_dlist.addDesc(nixlRemoteDesc(s.remote_blob.getDesc(), nixl_null_agent));
+        remote_dlist.addDesc(nixlRemoteDesc(s.remote_blob.getDesc(), s.remote_agent_name));
+
+        char dummy_mvh;
+        EXPECT_CALL(local_agent_helper_->getGMockEngine(),
+                    prepMemView(testing::_, testing::_, testing::_))
+            .WillOnce([&dummy_mvh](const nixl_remote_meta_dlist_t &prepared_dlist,
+                                   nixlMemViewH &mvh,
+                                   const nixl_opt_b_args_t *) {
+                EXPECT_EQ(prepared_dlist.descCount(), 2);
+                EXPECT_EQ(prepared_dlist[0].remoteAgent, nixl_null_agent);
+                EXPECT_NE(prepared_dlist[1].remoteAgent, nixl_null_agent);
+                mvh = &dummy_mvh;
+                return NIXL_SUCCESS;
+            });
+
         nixlMemViewH mvh = nullptr;
         EXPECT_EQ(local_agent_->prepMemView(remote_dlist, mvh), NIXL_SUCCESS);
-        EXPECT_NE(mvh, nullptr);
+        EXPECT_EQ(mvh, &dummy_mvh);
 
         local_agent_->releaseMemView(mvh);
     }

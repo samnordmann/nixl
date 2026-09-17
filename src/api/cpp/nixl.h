@@ -397,6 +397,13 @@ class nixlAgent {
          * list of backends hints is provided (via extra_params), the selection is limited to the
          * specified backends.
          *
+         * The remote owners must keep the described registrations and storage alive while the
+         * view can be used by device work. NIXL retains the exact imported metadata generation
+         * until releaseMemView(), so local metadata-cache invalidation does not invalidate an
+         * already prepared view. For loopback descriptors naming this agent, the local
+         * registration and storage must remain unchanged until all device work is complete and
+         * the view is released.
+         *
          * @param  dlist         [in]  Descriptor list for the remote buffers
          * @param  mvh           [out] Memory view handle for the remote buffers
          * @param  extra_params  [in]  Optional parameters
@@ -417,6 +424,9 @@ class nixlAgent {
          * backends hints is provided (via extra_params), the selection is limited to the specified
          * backends.
          *
+         * The local registrations and their storage must remain unchanged until all device work
+         * using the view is complete and the view is released.
+         *
          * @param  dlist         [in]  Descriptor list for the local buffers
          * @param  mvh           [out] Memory view handle for the local buffers
          * @param  extra_params  [in]  Optional parameters
@@ -429,6 +439,9 @@ class nixlAgent {
 
         /**
          * @brief  Release a memory view handle.
+         *
+         * The caller must first synchronize every CUDA stream whose work can access this handle.
+         * Releasing a handle while device work can still use it has undefined behavior.
          *
          * @param  mvh           [in] Memory view handle to be released
          */

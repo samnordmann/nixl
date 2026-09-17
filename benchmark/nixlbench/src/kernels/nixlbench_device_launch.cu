@@ -127,7 +127,8 @@ nixlbenchPutKernel(nixlbenchDeviceXferParams params) {
         for (size_t region_idx = 0; region_idx < params.numRegions; ++region_idx) {
             put_status =
                 nixlbenchPostPut<Level>(params, region_base + region_idx, channel_id, xfer_status);
-            if (put_status != NIXL_IN_PROG) {
+            // CUDA IPC may complete inline; that must not truncate the region batch.
+            if ((put_status != NIXL_SUCCESS) && (put_status != NIXL_IN_PROG)) {
                 break;
             }
         }

@@ -20,11 +20,16 @@
 
 #include "backend/backend_aux.h"
 
+#include <chrono>
+#include <optional>
+
 class nixlUcxWorker;
 
 namespace nixl::ucx {
 [[nodiscard]] void *
-createMemList(const nixl_remote_meta_dlist_t &, nixlUcxWorker &);
+createMemList(const nixl_remote_meta_dlist_t &,
+              nixlUcxWorker &,
+              std::optional<std::chrono::milliseconds> connection_timeout = std::nullopt);
 
 [[nodiscard]] void *
 createMemList(const nixl_meta_dlist_t &, const nixlUcxWorker &);
