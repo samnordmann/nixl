@@ -22,6 +22,7 @@
 
 #include <tuple>
 #include <iostream>
+#include <optional>
 #include <span>
 
 #include "nixl.h"
@@ -170,12 +171,29 @@ to_stride_dlist(nixl_mem_t mem, const py::array &descs) {
 }
 
 nixl_opt_args_t
-make_opt_args(const std::vector<uintptr_t> &backends) {
+make_opt_args(const std::vector<uintptr_t> &backends, const std::string &custom_param = {}) {
     nixl_opt_args_t extra_params;
     for (uintptr_t backend : backends) {
         extra_params.backends.push_back(reinterpret_cast<nixlBackendH *>(backend));
     }
+    extra_params.customParam = custom_param;
     return extra_params;
+}
+
+std::string
+make_device_custom_param(const std::optional<size_t> &worker_id,
+                         const std::optional<uint64_t> &connection_timeout_ms = std::nullopt) {
+    std::string custom_param;
+    if (worker_id) {
+        custom_param = "worker_id=" + std::to_string(*worker_id);
+    }
+    if (connection_timeout_ms) {
+        if (!custom_param.empty()) {
+            custom_param += ";";
+        }
+        custom_param += "connection_timeout_ms=" + std::to_string(*connection_timeout_ms);
+    }
+    return custom_param;
 }
 
 template<typename DlistT>
@@ -192,11 +210,28 @@ prep_xfer_dlist(const nixlAgent &agent,
 
 template<typename DlistT>
 uintptr_t
-prep_mem_view(const nixlAgent &agent, const DlistT &dlist, const std::vector<uintptr_t> &backends) {
-    const nixl_opt_args_t extra_params = make_opt_args(backends);
+prep_mem_view(const nixlAgent &agent,
+              const DlistT &dlist,
+              const std::vector<uintptr_t> &backends,
+              const std::string &custom_param = {}) {
+    const nixl_opt_args_t extra_params = make_opt_args(backends, custom_param);
     nixlMemViewH mvh;
     throw_nixl_exception(agent.prepMemView(dlist, mvh, &extra_params));
     return reinterpret_cast<uintptr_t>(mvh);
+}
+
+nixl_remote_dlist_t
+make_remote_dlist(const std::string &remote_agent, const nixl_xfer_dlist_t &dlist) {
+    if (remote_agent.empty()) {
+        throw std::invalid_argument("remote_agent must not be empty");
+    }
+
+    nixl_remote_dlist_t remote_dlist(dlist.getType(), dlist.descCount());
+    for (int i = 0; i < dlist.descCount(); ++i) {
+        const auto &desc = dlist[i];
+        remote_dlist[i] = nixlRemoteDesc(desc.addr, desc.len, desc.devId, remote_agent);
+    }
+    return remote_dlist;
 }
 } // namespace
 
@@ -207,6 +242,7 @@ PYBIND11_MODULE(_bindings, m) {
               "NIXL CPP APIs";
 
     m.attr("NIXL_INIT_AGENT") = NIXL_INIT_AGENT;
+    m.attr("NIXL_NULL_AGENT") = nixl_null_agent;
 
     m.attr("DEFAULT_COMM_PORT") = default_comm_port;
 
@@ -1053,21 +1089,62 @@ PYBIND11_MODULE(_bindings, m) {
             "prepMemView",
             [](nixlAgent &agent,
                const nixl_xfer_dlist_t &dlist,
-               const std::vector<uintptr_t> &backends) -> uintptr_t {
-                return prep_mem_view(agent, dlist, backends);
+               const std::vector<uintptr_t> &backends,
+               const std::optional<size_t> &worker_id) -> uintptr_t {
+                return prep_mem_view(agent, dlist, backends, make_device_custom_param(worker_id));
             },
             py::arg("dlist"),
             py::arg("backends") = std::vector<uintptr_t>({}),
+            py::arg("worker_id") = py::none(),
             py::call_guard<py::gil_scoped_release>())
         .def(
             "prepMemView",
             [](nixlAgent &agent,
                const nixl_remote_dlist_t &dlist,
-               const std::vector<uintptr_t> &backends) -> uintptr_t {
-                return prep_mem_view(agent, dlist, backends);
+               const std::vector<uintptr_t> &backends,
+               const std::optional<size_t> &worker_id,
+               const std::optional<uint64_t> &connection_timeout_ms) -> uintptr_t {
+                return prep_mem_view(agent,
+                                     dlist,
+                                     backends,
+                                     make_device_custom_param(worker_id, connection_timeout_ms));
             },
             py::arg("dlist"),
             py::arg("backends") = std::vector<uintptr_t>({}),
+            py::arg("worker_id") = py::none(),
+            py::arg("connection_timeout_ms") = py::none(),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "prepLocalMemView",
+            [](nixlAgent &agent,
+               const nixl_xfer_dlist_t &dlist,
+               const std::vector<uintptr_t> &backends,
+               const std::optional<size_t> &worker_id) -> uintptr_t {
+                return prep_mem_view(agent, dlist, backends, make_device_custom_param(worker_id));
+            },
+            py::arg("dlist"),
+            py::arg("backends") = std::vector<uintptr_t>({}),
+            py::arg("worker_id") = py::none(),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "prepRemoteMemView",
+            [](nixlAgent &agent,
+               const std::string &remote_agent,
+               const nixl_xfer_dlist_t &dlist,
+               const std::vector<uintptr_t> &backends,
+               const std::optional<size_t> &worker_id,
+               const std::optional<uint64_t> &connection_timeout_ms) -> uintptr_t {
+                const auto remote_dlist = make_remote_dlist(remote_agent, dlist);
+                return prep_mem_view(agent,
+                                     remote_dlist,
+                                     backends,
+                                     make_device_custom_param(worker_id, connection_timeout_ms));
+            },
+            py::arg("remote_agent"),
+            py::arg("dlist"),
+            py::arg("backends") = std::vector<uintptr_t>({}),
+            py::arg("worker_id") = py::none(),
+            py::arg("connection_timeout_ms") = py::none(),
             py::call_guard<py::gil_scoped_release>())
         .def(
             "releaseMemView",

@@ -47,6 +47,10 @@ def _load_cuda_backend() -> str:
 
 _pkg = sys.modules[_load_cuda_backend()]
 
+# Resolve optional subpackages such as ``nixl.device.cute`` from the selected
+# backend wheel without importing their optional dependencies eagerly.
+__path__ = [*__path__, *_pkg.__path__]
+
 submodules = ["_bindings", "_utils", "logging", "_api"]
 for sub_name in submodules:
     # Import submodule from actual wheel
@@ -65,9 +69,11 @@ if TYPE_CHECKING:
     from nixl import logging  # noqa: F401
     from nixl._api import (  # type: ignore[attr-defined]  # noqa: F401
         DEFAULT_COMM_PORT,
+        NIXL_NULL_AGENT,
         nixl_agent,
         nixl_agent_config,
         nixl_backend_handle,
+        nixl_device_view_handle,
         nixl_prepped_dlist_handle,
         nixl_thread_sync_t,
         nixl_xfer_handle,

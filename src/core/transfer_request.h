@@ -33,11 +33,10 @@ enum nixl_telemetry_stat_status_t {
     NIXL_TELEMETRY_FINISH = 2
 };
 
-class nixlRemoteSection;
+struct nixlRemoteRegistration;
 
-// Weak ref to the owning remote section: expires when that registration generation is
-// invalidated or replaced, which is the staleness signal for handles created against it.
-using nixl_remote_section_weak_t = std::weak_ptr<nixlRemoteSection>;
+// A registration expires on invalidation independently of GPU-view metadata retention.
+using nixl_remote_section_weak_t = std::weak_ptr<nixlRemoteRegistration>;
 
 // Contains pointers to corresponding backend engine and its handler, and populated
 // and verified DescLists, and other state and metadata needed for a NIXL transfer

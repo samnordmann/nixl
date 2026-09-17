@@ -86,10 +86,51 @@ if [ "$BUILD_NIXL_EP" = "true" ] && [ -z "$TORCH_VERSIONS" ]; then
     exit 1
 fi
 
+# Keep the existing CUDA-object release matrix, but restrict CuTe device
+# bitcode to architectures accepted by the qualified LLVM 20 producer. Clang
+# 20 has no sm_103 target, so that wheel remains usable for ordinary NIXL on
+# sm_103 while its CuTe extra fails closed there instead of shipping mislabeled
+# or unbuildable device bitcode.
+if [ "$BUILD_NIXL_EP" = "true" ]; then
+    NIXL_CUDA_ARCHS="90,100,103,120"
+    CUTE_BITCODE_ARCHS="90,100,120"
+else
+    NIXL_CUDA_ARCHS="80,86,89,90,100,103,120"
+    CUTE_BITCODE_ARCHS="80,86,89,90,100,120"
+fi
+
 set -e
 set -x
 
 TMP_DIR=$(mktemp -d)
+PYPROJECT_BACKUP="$TMP_DIR/pyproject.toml.original"
+cp -p -- pyproject.toml "$PYPROJECT_BACKUP"
+
+restore_source_and_cleanup() {
+    local STATUS=$?
+    trap - EXIT
+    if [ -f "$PYPROJECT_BACKUP" ]; then
+        if ! cp -p -- "$PYPROJECT_BACKUP" pyproject.toml; then
+            echo "ERROR: failed to restore pyproject.toml after wheel build" >&2
+            STATUS=1
+        elif ! cmp -s -- "$PYPROJECT_BACKUP" pyproject.toml; then
+            echo "ERROR: restored pyproject.toml does not match its byte snapshot" >&2
+            STATUS=1
+        fi
+    fi
+    if ! rm -rf -- "$TMP_DIR"; then
+        STATUS=1
+    fi
+    exit "$STATUS"
+}
+
+# tomlutil must temporarily specialize PEP 621 metadata for the CUDA wheel.
+# Restore the exact source bytes on success, failure, or interruption so a
+# subsequent CUDA variant cannot inherit the prior build's name/extras.
+trap restore_source_and_cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 CUDA_MAJOR=$(nvcc --version | grep -Eo 'release [0-9]+\.[0-9]+' | cut -d' ' -f2 | cut -d'.' -f1)
 # Must be 12 or 13
@@ -101,7 +142,13 @@ AUDITWHEEL_EXCLUDES="--exclude libcuda* --exclude libcufile* --exclude libcuobjc
 
 PKG_NAME="nixl-cu${CUDA_MAJOR}"
 CU_TAG="cu$(nvcc --version | grep -Eo 'release [0-9]+\.[0-9]+' | cut -d' ' -f2 | tr -d .)"
-./contrib/tomlutil.py --wheel-name $PKG_NAME pyproject.toml
+TOML_ARGS=(--wheel-name "$PKG_NAME")
+if [ "$CUDA_MAJOR" -eq 13 ]; then
+    # CUTLASS DSL 4.5.1's official cu13 extra installs two wheels that own the
+    # same paths (NVIDIA/cutlass#3259). Do not publish a nondeterministic extra.
+    TOML_ARGS+=(--remove-extra cute)
+fi
+./contrib/tomlutil.py "${TOML_ARGS[@]}" pyproject.toml
 
 TORCH_STABLE_INDEX="https://download.pytorch.org/whl/${CU_TAG}"
 TORCH_NIGHTLY_INDEX="https://download.pytorch.org/whl/nightly/${CU_TAG}"
@@ -253,6 +300,14 @@ build_wheel() {
         --no-build-isolation
         --out-dir "$OUT_DIR"
         --python "$VENV_PATH/bin/python"
+        -Csetup-args=-Dbuild_cute_device=enabled
+        "-Csetup-args=-Dnixl_cuda_arch_list=${NIXL_CUDA_ARCHS}"
+        "-Csetup-args=-Dcute_bitcode_arch=${CUTE_BITCODE_ARCHS}"
+        -Csetup-args=-Dcute_llvm_path=/opt/llvm-20/bin
+        -Csetup-args=-Dcute_cuda_path=/usr/local/cuda
+        -Csetup-args=-Ducx_path=/usr/local
+        -Csetup-args=-Dcudapath_inc=/usr/local/cuda/include
+        -Csetup-args=-Dcudapath_lib=/usr/local/cuda/lib64
     )
     if [ "$BUILD_NIXL_EP" = "true" ]; then
         BUILD_ARGS+=(
@@ -268,12 +323,29 @@ build_wheel() {
     destroy_torch_venv "$VER"
 }
 
+# Validate the files inside the wheel rather than trusting Meson's successful
+# exit. This makes release packaging fail closed if an install rule regresses,
+# and also authenticates the bitcode against the adjacent ABI manifest.
+assert_cute_artifacts() {
+    local WHEEL=$1
+    local PACKAGE_DIR="nixl_cu${CUDA_MAJOR}/device/cute"
+
+    python3 ./contrib/validate_cute_wheel.py \
+        --package-dir "$PACKAGE_DIR" \
+        --architectures "$CUTE_BITCODE_ARCHS" \
+        "$WHEEL"
+}
+
 repair_wheel() {
     local IN_DIR=$1
     local OUT_DIR=$2
     mkdir -p "$OUT_DIR"
     auditwheel repair $AUDITWHEEL_EXCLUDES "$IN_DIR"/nixl*.whl --plat "$WHL_PLATFORM" --wheel-dir "$OUT_DIR"
     ./contrib/wheel_add_ucx_plugins.py --ucx-plugins-dir "$UCX_PLUGINS_DIR" --nixl-plugins-dir "$NIXL_PLUGINS_DIR" "$OUT_DIR"/*.whl
+    local WHEEL
+    for WHEEL in "$OUT_DIR"/nixl*.whl; do
+        assert_cute_artifacts "$WHEEL"
+    done
 }
 
 # Echo the path of the single .whl in $1, or exit if the count is not 1.
@@ -343,6 +415,7 @@ if [ "$BUILD_NIXL_EP" = "true" ] && [ -n "$TORCH_VERSIONS" ]; then
         rm -rf "$EP_TMP"
     done
 
+    assert_cute_artifacts "$BASE_WHL"
     cp "$BASE_WHL" "$OUTPUT_DIR"
 else
     build_wheel "$TMP_DIR"
@@ -350,5 +423,4 @@ else
     cp "$(get_wheel_path "$TMP_DIR/dist")" "$OUTPUT_DIR"
 fi
 
-# Clean up
-rm -rf "$TMP_DIR"
+# EXIT restores pyproject.toml byte-for-byte, verifies it, and removes TMP_DIR.

@@ -34,6 +34,10 @@ dependencies = [@WHEEL_DEPS@]
 [project.optional-dependencies]
 cu12 = ["nixl-cu12==@VERSION@"]
 cu13 = ["nixl-cu13==@VERSION@"]
+# CUDA 13 intentionally has no declared CuTe extra in this release. CUTLASS
+# DSL 4.5.1's official cu13 dependency set has overlapping-wheel issue #3259;
+# the plain/base payload is not a valid CUDA 13 substitute.
+cute-cu12 = ["nvidia-cutlass-dsl==4.5.1", "cuda-python>=12.8,<13"]
 
 [tool.setuptools]
 packages = ["nixl", "nixl_ep"]
