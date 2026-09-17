@@ -2,7 +2,8 @@
 
 This directory demonstrates the version 3 NIXL device ABI from CUTLASS CuTe
 DSL 4.5 kernels. The examples progress from one PUT to ordered signaling,
-THREAD/WARP measurement, and a GPU-persistent transport benchmark. Every remote example uses distinct GPU processes: modern UCX needs
+THREAD/WARP measurement, and a complete elastic MoE dispatch/expert/combine
+reference. Every remote example uses distinct GPU processes: modern UCX needs
 a real CUDA-IPC peer lane for a remote device memory view; a same-process,
 same-GPU loopback is not a valid substitute.
 
@@ -98,6 +99,224 @@ result is the peer allocation's base in the calling process; every access uses
 that base plus a descriptor-relative offset. CUDA IPC may map it at a different
 numeric address from the owner's process, and numeric equality is not required.
 `--allow-unverified-mapped` remains a deprecated compatibility no-op.
+
+### 5. Readable elastic MoE communication
+
+The reference example performs deterministic active-expert top-k routing, BF16
+dispatch, per-expert batching and transform, reverse combine communication,
+weighted scatter/combine, and a CPU golden comparison on every active rank.
+The default four-generation plan expands, sparsely removes rank 2, and rejoins
+the same stable slot:
+
+```text
+[0, 1] -> [0, 1, 2, 3] -> [0, 1, 3] -> [0, 1, 2, 3]
+```
+
+```bash
+python examples/python/cute/elastic_moe.py \
+  --devices 0 1 2 3 \
+  --plan examples/python/cute/elastic_expansion_contraction.json \
+  --experts-per-rank 2 --top-k 2 \
+  --num-tokens 8 --hidden-size 256 \
+  --warmup 1 --iterations 3
+```
+
+It follows the in-tree NIXL EP elastic model where it can do so safely:
+
+- Buffer capacity is fixed once at `max_ranks`; phase membership is a mask.
+- Expert IDs are permanent: `rank * experts_per_rank + local_expert`.
+- Every receiver has one padded, single-writer slab for every possible source,
+  including sparse inactive holes.
+- Each slab carries a versioned `NXME` preamble with generation, origin,
+  destination, record count, and element size. Record headers carry token,
+  route-slot, and expert identity. Stale or misrouted slabs fail validation,
+  including empty slabs.
+- Next-generation metadata and peer views are prepared while old views remain
+  active. By default, one old-generation MoE round runs after staging to prove
+  that preparation does not implicitly activate a join.
+- Commit happens only after a full quiescent fence. A stable GPU rank-mask
+  allocation is updated in stream order; every remote PUT and its completion
+  atomic dynamically read that mask before posting. Expansion phases first
+  probe staged join views while they are still masked and require
+  `NIXL_ERR_NOT_ALLOWED`. Old views are then released, removed metadata is
+  invalidated, and same-slot re-add waits the same five-second grace used by
+  the mature EP elastic test.
+- PUT and its remote counter atomic use one channel. The fixed preamble makes a
+  zero-record message unambiguous, so the counter advances by exactly one.
+
+This example keeps all maximum-capacity processes alive as standby ranks. It
+demonstrates staged membership/view elasticity, sparse routing, contraction,
+and same-slot rejoin; it is not equivalent to independently starting/exiting
+worker processes, failure detection, or recovery from SIGKILL/node loss.
+Negative killed-rank entries from the mature EP JSON plans are rejected.
+Its rank mask is an application-owned local CUDA tensor updated only at a
+quiescent generation boundary; it does not reproduce the mature EP path's
+concurrent timeout/failure-mask update protocol.
+
+For the optimized production data path and process-level elastic harness, see
+[NIXL EP Buffer](../../device/ep/nixl_ep/buffer.py),
+[elastic test](../../device/ep/tests/elastic/elastic.py), and
+[low-latency kernels](../../device/ep/csrc/kernels/nixl_ep_ll.cu). The CuTe example
+deliberately uses CPU routing/packing plus synchronous one-slab-per-peer PUTs so
+the protocol and lifetimes stay readable. It should not be presented as an EP
+performance competitor.
+
+### 6. Persistent low-latency elastic MoE
+
+`elastic_moe_ll.py` is the performance-oriented end-to-end example. It keeps
+one cooperative CuTe kernel resident for the complete membership generation
+and performs dispatch, a deterministic BF16 expert, reverse result transfer,
+FP32 weighted top-k reduction, and versioned next-round handshakes without host work or
+another launch inside the measured loop:
+
+```bash
+python examples/python/cute/elastic_moe_ll.py \
+  --devices 0 1 2 3 \
+  --membership '0,1;0,1,2,3;0,1,3;0,1,2,3' \
+  --experts-per-rank 2 --top-k 2 \
+  --num-tokens 8 --hidden-size 256 \
+  --warmup 20 --iterations 100 --timing-mode none
+```
+
+The arena has stable sparse rank slots and one communication bank by default.
+The reverse combine-ready/next-dispatch-ready handshake plus the final
+all-combine-read grid barrier proves that bank is consumed before reuse. In the
+uninstrumented two-bank specialization, the following round's retained
+pre-reduction barrier joins every prior reader before round N+2 can reuse bank
+N, so the otherwise redundant final barrier is compiled out. Timed two-bank
+modes add only the joins their metric needs: envelope adds one terminal join,
+while cadence and peer add end joins on measured rounds but not warmup.
+Dispatch records carry
+only token, route slot, gate, and payload; one separate bucket stamp validates
+generation and source incarnation before the release-ready word is accepted.
+Even an empty expert bucket publishes `record_count + 1`. Expert task leaders
+join any shard warps with GPU-scope release/acquire operations. One peer leader
+then joins all of that peer's experts and performs a single cumulative
+system-release publication carrying the aggregate record count. The matching
+peer leader acquires it once, validates one peer stamp, and a cooperative grid
+barrier makes every route-slot payload visible before disjoint token reducers
+accumulate in FP32 and cast once to BF16. The one-bank path uses a second grid
+barrier to protect combine-bank reuse; the two-bank path uses the next round's
+retained join described above and adds end joins only for requested timing
+semantics. Thus system-scope publication and polling scale with active peers,
+not experts, and there is no CPU synchronization or launch in the kernel loop.
+
+The default device wait is the production, timer-free specialization: a ready
+word costs one acquire load, and only repeated misses sample owner-local and
+peer abort epochs. `--device-timeout-ms` opts into a timer-reading diagnostic
+specialization. Device-detected protocol errors publish a phase-wide system
+abort, but neither mode recovers abrupt mapped-owner loss. In particular, a
+kernel that never launches cannot announce a device abort; use the scheduler or
+another external job timeout as the final failure bound.
+
+`--timing-mode none` is the default deployment specialization: all `%globaltimer`
+reads, timing stores, and the timing-only cooperative barrier are compiled out.
+Use `envelope` for only a first-start/final-output-ready pair, `cadence` for
+round-start throughput analysis, and `peer` (or the compatibility alias
+`--instrument-per-peer`) only for perturbing diagnostics. Compare the
+uninstrumented and diagnostic specializations with same-stream CUDA events
+around the whole persistent launch; per-rank `%globaltimer` epochs are never
+subtracted across GPUs.
+
+Every cooperative launch is checked against the exact CUDA library already
+loaded and owned by its bound specialization before the registered view is
+used. The host converts that borrowed runtime handle to its native Driver
+handle, resolves the exact `kernel_info` symbol, proves that the kernel belongs
+to the same library, obtains its current-context function, and queries block
+residency for the requested block size. It neither loads nor unloads a second
+module. The same bound callable is launched for measurement. Ordinary
+execution therefore needs no retained compiler file or path-bearing compile
+option, preserving CuTe's reusable JIT-cache key and eliminating cross-rank
+dump-file races. This check adds no device instruction and is outside timing.
+`--warps-per-cta` remains an explicit tuning control because the best grid
+shape is specialization- and architecture-dependent.
+
+Every worker compiles into a fresh rank-private directory. This is a correctness
+requirement, not cosmetic logging: CuTe 4.5.1 truncates long specialization
+names, so rank-specialized PTX/CUBIN files can otherwise share one basename.
+The default directory is private to the temporary run and is removed afterward.
+Pass an existing parent with `--codegen-dump-root PATH` to retain `rank-0/`,
+`rank-1/`, and so on for inspection; those target rank directories must not
+already exist and are rejected rather than reused. The process-elastic variant
+additionally includes the incarnation in each private directory name.
+
+This low-latency example intentionally implements only the mapped CUDA-IPC data
+path. Before allocating or launching it requires CUDA native peer atomics for
+every directed pair of participating GPUs. Each worker queries only its local
+accessor row, so its control-plane record is linear in fixed rank capacity; the
+phase summary validates and combines those rows into one canonical matrix. Its
+device preflight then classifies each active pointer from the exact view and
+arena allocation used by the timed phase and fails closed when `nixlGetPtr`
+returns null. The returned address is
+local to the importing process and may differ from the allocation owner's
+numeric address; every remote access uses that process-local base plus an arena
+offset. `--allow-unverified-mapped` is only a deprecated no-op for old
+launch scripts. A future non-mapped path must add generated-buffer NIXL PUTs,
+ordered transport publication, and returned credits as one coherent protocol;
+the example does not silently mix an incomplete fallback into the mapped kernel.
+
+#### Graceful OS-process elasticity
+
+`elastic_moe_ll_process.py` applies the same persistent kernel to actual
+process membership. A slot has no worker while inactive; removal destroys that
+worker, and rejoin creates a new CUDA context, NIXL agent and registration with
+a monotonically larger incarnation and unique agent name:
+
+```bash
+python examples/python/cute/elastic_moe_ll_process.py \
+  --devices 0 1 \
+  --membership '0,1;0;0,1' \
+  --experts-per-rank 2 --top-k 2 \
+  --num-tokens 8 --hidden-size 256 \
+  --warmup 20 --iterations 100 --timing-mode none
+```
+
+The bounded local coordinator admits a generation only after every candidate
+has registered, connected, staged its compact dispatch template, prepared its
+sparse view and passed mapped-pointer preflight. Each worker publishes either
+`CANDIDATE_PREPARED` or a failure while keeping its owner registered. All
+prepared candidates wait for the coordinator's `COMMIT|ABORT` decision. On an
+ordinary setup failure or pre-GO timeout, `ABORT` makes every active worker
+drain queued CUDA work, explicitly release (and retry) any device view, unload
+its known remote identities, publish `SAFE_TO_SHUTDOWN`, and remain registered
+until the coordinator observes the complete safe quorum and publishes
+`SHUTDOWN`. Staging, preflight, and the pinned status snapshot still share one
+stream drain; the failure-only protocol adds no healthy-path rendezvous.
+
+On success the coordinator publishes `COMMIT`, waits for every
+`COMMIT_ACKNOWLEDGED`, and publishes `GO`. Every worker then durably publishes
+`GO_OBSERVED` and waits on that same all-rank marker set before enqueueing, so
+no marker fsync can overlap another rank's persistent GPU interval. After the
+one persistent kernel drains, all old view contexts exit and every retiring remote identity is
+unloaded before its owner deregisters; unchanged `(slot, incarnation, agent)`
+peers retain their NIXL metadata and UCX connection across generations and
+unchanged/removal-only generations skip metadata, coordinate, and connection
+handshakes. A post-GO Python, marker, validation, or remote-removal error is
+carried by the existing unload/result convergence; every live worker then
+unloads retained identities and uses the same all-safe `SHUTDOWN` ordering.
+Statuses, outputs, and optional timing data are copied to reusable pinned
+buffers on the kernel stream before its single host drain, so validation adds
+no implicit CUDA wait. The coordinator observes process exit before reusing a
+stable GPU slot. Singleton generations pad every fixed-capacity descriptor with
+the rank's registered loopback arena and run only the dedicated local MoE path.
+This avoids UCX v1.23.x's unsafe `NULL_AGENT` device-list gap behavior without
+adding an instruction to the persistent loop.
+
+This lifecycle adds no instruction, launch or CPU synchronization to the
+measured kernel loop. It is intentionally same-node and graceful, with
+transition downtime. Actual process/SIGKILL or coordinator loss, inability to
+publish or read the failure/decision/safety files, ambiguous `GO` observation,
+an unquiescent CUDA stream, a device view that remains valid after its explicit
+release retry, or a persistent remote-invalidation failure is catastrophic
+fail-stop: the complete job must be terminated and no replacement is admitted.
+The harness does not claim that CUDA-IPC access survives such abrupt owner
+loss. Use an external Slurm timeout as the final bound around fault-injection
+runs. The example coordinator uses filesystem markers, polling, and durability
+calls for readable lifecycle evidence; it is not an online control plane or a
+transition-latency reference. New workers are started only after the preceding
+drained generation retires; a production control plane should pre-spawn,
+register, compile, connect, stage, and preflight joiners on free slots while the
+current generation is still serving.
 
 ## Version 3 contract
 
