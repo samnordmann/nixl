@@ -27,7 +27,7 @@
 </section>
 <section id="setup">
 <h2>Before running</h2>
-<p>Use separate GPUs on one node, NIXL built from this checkout with UCX GPU-device support, CUTLASS DSL 4.5.1, and LLVM 20. Use the same UCX installation for the host library and the device shims. On CUDA 13, use a separately qualified CUDA-13-compatible CuTe source environment.</p>
+<p>Use separate GPUs on one node and NIXL built from this checkout with UCX GPU-device support. The validated setup is GB200, NVIDIA PyTorch 26.06 (CUDA 13.3), UCX 1.21.0, CUTLASS DSL 4.5.1, and LLVM 20. Use the same UCX installation for the host library and the device shims. All four tutorial commands below passed on this setup, as did the 12 CPU checks; this is correctness evidence, not a performance result.</p>
 <pre><code># From the repository root, after building/installing NIXL:
 export PYTHONPATH="$PWD/src/bindings/python/nixl-meta:$PYTHONPATH"
 python examples/python/cute/build.py --ucx /opt/hpcx/ucx --arch sm_100</code></pre>

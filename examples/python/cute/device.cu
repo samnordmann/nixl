@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// UCX 1.23 recognizes NVCC, but not Clang, when defining device qualifiers.
+// UCX uses NVCC-specific checks when defining device qualifiers.
 #pragma push_macro("__NVCC__")
 #pragma push_macro("__builtin_ia32_prefetch")
 #define __NVCC__

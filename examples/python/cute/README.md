@@ -7,10 +7,10 @@ for the incremental tutorial and code map.
 
 ## Build
 
-Use an installed NIXL built from this checkout with UCX GPU-device support,
-CUDA, CUTLASS DSL 4.5.1, and LLVM 20. The bitcode must use the same UCX headers
-as the host NIXL build. On CUDA 13, use a CUDA-13-compatible CUTLASS DSL source
-installation; this example does not introduce wheel/extras support.
+Use NIXL built/installed from this checkout with UCX GPU-device support.
+The bitcode must use the same UCX headers as the host NIXL build. Validated
+setup: GB200, NVIDIA PyTorch 26.06 (CUDA 13.3), UCX 1.21.0, CUTLASS DSL 4.5.1,
+and LLVM 20. This example does not introduce wheel/extras support.
 
 ```bash
 # After building/installing NIXL with UCX, from the repository root:
@@ -63,4 +63,6 @@ request-backed calls. Without it, a successful CUDA-IPC PUT can poll a UCX
 request that was never initialized. Other native cleanups from the full stack
 are intentionally excluded.
 
-CPU model/build-helper checks: `python -m pytest -q test/python/test_cute_mvp.py`.
+Validation: all four commands above passed on GB200 (2026-09-17).
+CPU model/build-helper checks: `python -m pytest -q test/python/test_cute_mvp.py`
+(12 passed). These are correctness checks, not performance measurements.
