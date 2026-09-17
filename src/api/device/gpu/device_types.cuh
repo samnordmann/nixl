@@ -25,7 +25,10 @@
 namespace nixl::gpu {
 
 struct xferStatusH {
-    alignas(16) unsigned char storage[64] = {};
+    // Keep this an uninitialized POD so it can reside in CUDA shared memory.
+    // Callers that need a zeroed local object can still use xferStatusH{};
+    // device transports initialize request state when an operation is posted.
+    alignas(16) unsigned char storage[64];
 };
 
 constexpr size_t xfer_status_payload_size = 64;

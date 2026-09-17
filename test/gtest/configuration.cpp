@@ -20,6 +20,8 @@
 #include "gtest/gtest.h"
 #include "common.h"
 
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdlib.h>
 #include <string>

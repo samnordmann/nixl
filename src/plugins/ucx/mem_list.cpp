@@ -117,7 +117,9 @@ memListElement::create(const nixlMetaDesc &desc) {
     element.field_mask =
         UCP_DEVICE_MEM_LIST_ELEM_FIELD_MEMH | UCP_DEVICE_MEM_LIST_ELEM_FIELD_LOCAL_ADDR;
     element.memh = md->getMem().getMemh();
-    element.local_addr = md->getMem().getBase();
+    // Device offsets are relative to the prepared descriptor, which may be a
+    // subrange of the registered allocation represented by memh.
+    element.local_addr = reinterpret_cast<void *>(desc.addr);
     return element;
 }
 
@@ -147,7 +149,9 @@ createElements(const T &dlist, size_t worker_id = 0) {
 }
 
 void *
-createMemList(const nixl_remote_meta_dlist_t &dlist, nixlUcxWorker &worker) {
+createMemList(const nixl_remote_meta_dlist_t &dlist,
+              nixlUcxWorker &worker,
+              std::optional<std::chrono::milliseconds> connection_timeout) {
     using namespace std::chrono_literals;
 
     const device_mem_vector_t elements = createElements(dlist, worker.getId());
@@ -162,7 +166,13 @@ createMemList(const nixl_remote_meta_dlist_t &dlist, nixlUcxWorker &worker) {
     const auto start = std::chrono::steady_clock::now();
     while ((status = ucp_device_remote_mem_list_create(params.get(), &handle)) ==
            UCS_ERR_NOT_CONNECTED) {
-        if ((std::chrono::steady_clock::now() - start) > next_warning) {
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        if (connection_timeout && elapsed >= *connection_timeout) {
+            throw std::runtime_error(error_message + "(remote): connection timed out after " +
+                                     std::to_string(connection_timeout->count()) + " ms");
+        }
+
+        if (elapsed > next_warning) {
             NIXL_WARN << "Still waiting to create device memory list after " << next_warning.count()
                       << " ms; retrying";
             next_warning += timeout_warning;
@@ -206,7 +216,9 @@ const std::string error_message{"UCX GPU device API is not supported"};
 
 namespace nixl::ucx {
 void *
-createMemList(const nixl_remote_meta_dlist_t &, nixlUcxWorker &) {
+createMemList(const nixl_remote_meta_dlist_t &,
+              nixlUcxWorker &,
+              std::optional<std::chrono::milliseconds>) {
     throw std::runtime_error(error_message);
 }
 

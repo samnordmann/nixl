@@ -20,6 +20,7 @@
 #include <gpu/device_types.cuh>
 
 #include <ucp/api/device/ucp_device_impl.h>
+#include <ucp/api/ucp_version.h>
 
 #include <cassert>
 #include <cstring>
@@ -57,18 +58,27 @@ toUcpFlags(uint64_t nixl_flags) noexcept {
 }
 
 /**
- * Convert the status of a *submission*, which is not the same mapping as a
- * completion poll. UCS_OK here means UCX accepted the operation, not that it
- * finished: the transfer is reported complete later, through getXferStatus.
- * Any non-error therefore reports NIXL_IN_PROG, and only getXferStatus is
- * allowed to return NIXL_SUCCESS.
+ * Convert the status of a submission while preserving NIXL's requestless-post
+ * contract. UCX defines UCS_OK as completed and UCS_INPROGRESS as requiring
+ * progress through the supplied request. A requestless NIXL operation cannot
+ * expose completion, however, so every accepted requestless post deliberately
+ * returns NIXL_IN_PROG.
  */
 __device__ inline nixl_status_t
-convertSubmitStatus(ucs_status_t status) {
-    if (!UCS_STATUS_IS_ERR(status)) {
+convertSubmitStatus(ucs_status_t status, bool completion_tracked) {
+    if (status == UCS_OK) {
+        return completion_tracked ? NIXL_SUCCESS : NIXL_IN_PROG;
+    }
+    if (status == UCS_INPROGRESS) {
         return NIXL_IN_PROG;
     }
+    // Device callers propagate the NIXL status to an error buffer.  Avoid a
+    // latent vprintf call in every inlined PUT/atomic hot path: even an untaken
+    // diagnostic branch increases generated code and can raise register/I-cache
+    // pressure in persistent communication kernels.
+#if defined(NIXL_GPU_DEVICE_ENABLE_PRINTF)
     printf("UCX returned error: %d\n", status);
+#endif
     return NIXL_ERR_BACKEND;
 }
 
@@ -76,6 +86,8 @@ __device__ inline ucp_device_request_t *
 requestPtr(xferStatusH *xfer_status) {
     static_assert(sizeof(ucp_device_request_t) <= xfer_status_payload_size,
                   "transfer-status payload is too small for UCX device request");
+    static_assert(alignof(ucp_device_request_t) <= alignof(xferStatusH),
+                  "transfer-status payload alignment is too small for UCX device request");
     return xfer_status ? reinterpret_cast<ucp_device_request_t *>(xfer_status->storage) : nullptr;
 }
 
@@ -125,7 +137,7 @@ put(const memViewElem &src,
                                                                      channel_id,
                                                                      toUcpFlags(flags),
                                                                      requestPtr(xfer_status));
-    return convertSubmitStatus(status);
+    return convertSubmitStatus(status, xfer_status != nullptr);
 }
 
 template<level_t level>
@@ -144,15 +156,40 @@ atomicAdd(uint64_t value,
                                                              channel_id,
                                                              toUcpFlags(flags),
                                                              requestPtr(xfer_status));
-    return convertSubmitStatus(status);
+    return convertSubmitStatus(status, xfer_status != nullptr);
 }
 
 __device__ inline void *
 getPtr(nixlMemViewH mvh, size_t index) {
     auto mem_list = remoteMemList(mvh);
+    uint64_t remote_address;
+    uct_device_ep_t *device_ep;
+#if UCP_API_VERSION >= UCP_VERSION(1, 22)
+    const uct_device_mem_elem_t *uct_element;
+#else
+    const uct_device_mem_element_t *uct_element;
+#endif
+    uct_device_completion_t *unused_completion = nullptr;
+
+    // UCX represents a NULL_AGENT gap with a null endpoint, while
+    // ucp_device_get_ptr() dereferences that endpoint. Use UCX's installed
+    // inline preparation helper to decode the version-specific list layout,
+    // then reject the gap before calling the same UCT pointer primitive.
+    // UCX 1.22 added an explicit lane argument; get_ptr always uses lane zero.
+#if UCP_API_VERSION >= UCP_VERSION(1, 22)
+    const auto status = ucp_device_prepare_send_remote(
+        mem_list, index, remote_address, 0, nullptr, device_ep, uct_element, unused_completion);
+#else
+    const auto status = ucp_device_prepare_send_remote(
+        mem_list, index, remote_address, nullptr, device_ep, uct_element, unused_completion);
+#endif
+    if ((status != UCS_OK) || (device_ep == nullptr)) {
+        return nullptr;
+    }
+
     void *ptr = nullptr;
-    ucp_device_get_ptr(mem_list, index, &ptr);
-    return ptr;
+    const auto ptr_status = uct_device_ep_get_ptr(device_ep, uct_element, remote_address, &ptr);
+    return ptr_status == UCS_OK ? ptr : nullptr;
 }
 
 } // namespace nixl::gpu::impl::ucx
