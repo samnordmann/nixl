@@ -16,11 +16,18 @@
 # limitations under the License.
 
 import argparse
+from collections.abc import MutableMapping
 
 import tomlkit
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--wheel-name", type=str, help="Set the project name")
+parser.add_argument(
+    "--remove-extra",
+    action="append",
+    default=[],
+    help="Remove one project.optional-dependencies entry (repeatable)",
+)
 parser.add_argument("file", type=str, help="The toml file to modify")
 args = parser.parse_args()
 
@@ -34,7 +41,18 @@ if args.wheel_name:
     # [project]
     # name = "<wheel_name>"
     # ```
-    doc["project"]["name"] = args.wheel_name
+    project_table = doc["project"]
+    if not isinstance(project_table, MutableMapping):
+        raise TypeError("project must be a TOML table")
+    project_table["name"] = args.wheel_name
+
+for extra in args.remove_extra:
+    optional_project = doc.get("project")
+    if not isinstance(optional_project, MutableMapping):
+        continue
+    optional = optional_project.get("optional-dependencies")
+    if isinstance(optional, MutableMapping):
+        optional.pop(extra, None)
 
 with open(args.file, "w") as f:
     f.write(tomlkit.dumps(doc))

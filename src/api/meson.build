@@ -14,5 +14,18 @@
 # limitations under the License.
 
 subdir('cpp')
+
+cute_device_artifacts = []
+cute_device_enabled = false
+if not get_option('build_cute_device').disabled()
+  if ucx_gpu_device_api_available
+    subdir('gpu/ucx/cute')
+  elif get_option('build_cute_device').enabled()
+    error('build_cute_device requires the UCX GPU Device API')
+  else
+    message('CuTe DSL device bitcode disabled: UCX GPU Device API is unavailable')
+  endif
+endif
+
 subdir('python')
 subdir('device')

@@ -15,9 +15,11 @@
 
 from ._api import (
     DEFAULT_COMM_PORT,
+    NIXL_NULL_AGENT,
     nixl_agent,
     nixl_agent_config,
     nixl_backend_handle,
+    nixl_device_view_handle,
     nixl_prepped_dlist_handle,
     nixl_thread_sync_t,
     nixl_xfer_handle,
@@ -26,10 +28,12 @@ from ._api import (
 __all__ = [
     # Constants
     "DEFAULT_COMM_PORT",
+    "NIXL_NULL_AGENT",
     # Main classes
     "nixl_agent",
     "nixl_agent_config",
     "nixl_backend_handle",
+    "nixl_device_view_handle",
     "nixl_prepped_dlist_handle",
     "nixl_thread_sync_t",
     "nixl_xfer_handle",

@@ -604,6 +604,9 @@ if get_option('install_headers')
   install_headers('src/infra/mem_section.h', install_dir: prefix_inc)
   install_headers('src/core/telemetry/telemetry_event.h', install_dir: prefix_inc)
 
+  if cute_device_enabled
+    install_headers('src/api/gpu/ucx/cute/nixl_device_cute.cuh', install_dir: prefix_inc + '/gpu/cute')
+  endif
 endif
 
 # Doxygen documentation
