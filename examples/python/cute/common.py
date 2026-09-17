@@ -125,7 +125,7 @@ class World:
         dist.barrier()
         for peer in sorted(joining):
             self.agent.make_connection(f"cute-{peer}")
-            self.agent.send_notif(f"cute-{peer}", b"connected", backend="UCX")
+            self.agent.send_notif(f"cute-{peer}", b"connected")
         pending, deadline = {f"cute-{peer}" for peer in joining}, time.monotonic() + 60
         while pending:
             for name, messages in self.agent.get_new_notifs().items():
