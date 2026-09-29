@@ -79,7 +79,8 @@ def main():
         run(
             "opt",
             "--passes=internalize,inline,globaldce",
-            "-internalize-public-api-list=cute_nixl_put,cute_nixl_signal,cute_nixl_wait",
+            "-internalize-public-api-list=cute_nixl_put,cute_nixl_signal,"
+            "cute_nixl_wait,cute_nixl_put_batch",
             "-S",
             raw,
             "-o",

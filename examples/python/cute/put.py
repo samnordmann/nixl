@@ -12,6 +12,7 @@ from common import run
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-signal", action="store_true")
+    parser.add_argument("--batched", action="store_true")
     args = parser.parse_args()
 
     def example(world):
@@ -22,7 +23,7 @@ def main():
             # Changing every iteration also checks signal epochs and buffer reuse.
             for peer in range(2):
                 world.send[peer].fill_(world.rank * 10 + peer + iteration * 100)
-            world.exchange(with_signal=args.with_signal)
+            world.exchange(with_signal=args.with_signal, batched=args.batched)
             expected = torch.stack(
                 [
                     torch.full_like(

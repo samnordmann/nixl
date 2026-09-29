@@ -28,6 +28,15 @@ def _signal(remote: cutlass.Uint64, offset: cutlass.Uint64) -> cutlass.Int32: ..
 def _wait(address: cutlass.Uint64, expected: cutlass.Uint64) -> cutlass.Int32: ...
 
 
+@cute.extern(name="cute_nixl_put_batch", source=_bitcode)
+def _put_batch(
+    local: cutlass.Uint64,
+    plan: cutlass.Uint64,
+    size: cutlass.Uint64,
+    count: cutlass.Int32,
+) -> cutlass.Int32: ...
+
+
 def put(local, remote, size, local_offset=0, remote_offset=0):
     """Copy descriptor 0 and wait on the GPU. Returns a NIXL status, not a CPU wait."""
     result = _put(
@@ -52,3 +61,19 @@ def wait(address, expected):
     return cutlass.Uint32(
         _wait(cutlass.Uint64(address), cutlass.Uint64(expected))
     ).bitcast(cutlass.Int32)
+
+
+def put_batch(local, plan: cute.Tensor, size):
+    """Submit up to eight descriptor-0 PUTs, then complete the batch on the GPU.
+
+    Plan is a contiguous int64[count, 3] tensor of remote view / source byte
+    offset / destination byte offset. Sources, destinations and the plan must
+    stay live and unmodified until completion. This call does not signal peers.
+    """
+    result = _put_batch(
+        cutlass.Uint64(local),
+        cutlass.Uint64(plan.iterator.toint()),
+        cutlass.Uint64(size),
+        cutlass.Int32(plan.shape[0]),
+    )
+    return cutlass.Uint32(result).bitcast(cutlass.Int32)

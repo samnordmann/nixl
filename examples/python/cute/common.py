@@ -54,6 +54,38 @@ def send(
 
 
 @cute.kernel
+def batch_kernel(
+    local: cutlass.Uint64,
+    plan: cute.Tensor,
+    size: cutlass.Uint64,
+    counter_offset: cutlass.Uint64,
+    status: cute.Tensor,
+    with_signal: cutlass.Constexpr,
+):
+    result = ops.put_batch(local, plan, size)
+    status[0, 0] = result
+    if cutlass.const_expr(with_signal):
+        if result == 0:
+            for i in range(plan.shape[0]):
+                status[i, 1] = ops.signal(plan[i, 0], counter_offset)
+
+
+@cute.jit
+def send_batch(
+    local: cutlass.Uint64,
+    plan: cute.Tensor,
+    size: cutlass.Uint64,
+    counter_offset: cutlass.Uint64,
+    status: cute.Tensor,
+    with_signal: cutlass.Constexpr,
+    stream: cuda.CUstream,
+):
+    batch_kernel(local, plan, size, counter_offset, status, with_signal).launch(
+        grid=(1, 1, 1), block=(1, 1, 1), stream=stream
+    )
+
+
+@cute.kernel
 def wait_kernel(address: cutlass.Uint64, expected: cutlass.Uint64, status: cute.Tensor):
     status[2] = ops.wait(address, expected)
 
@@ -113,6 +145,7 @@ class World:
         self.metadata = gather((self.agent.get_agent_metadata(), coords))
         self.local = self.agent.prep_mem_view(self.agent.get_xfer_descs(self.send))
         self.peers, self.active = {}, ()
+        self.batch_plan = None
         self.expected = [0] * self.size
         self.slot_bytes = rows * hidden * self.send.element_size()
 
@@ -145,15 +178,35 @@ class World:
             self.agent.release_mem_view(staged.pop(peer))
             self.agent.remove_remote_agent(f"cute-{peer}")
         self.peers, self.active = staged, tuple(active)
+        self.batch_plan = None
         dist.barrier()
 
-    def exchange(self, with_signal=True):
-        """Send one padded slab per active peer, then wait before reading/reusing it."""
-        self.stream.synchronize()
-        dist.barrier()  # Everyone has consumed the previous contents of recv.
-        self.status.zero_()
-        if self.rank in self.active:
-            self.recv[self.rank].copy_(self.send[self.rank])
+    def post_sends(self, with_signal=True, *, batched=False):
+        """Enqueue outgoing work; the caller still owns receive and reuse ordering."""
+        if not self.peers:
+            return
+        if batched:
+            if len(self.peers) > 8:
+                raise ValueError("the private batch supports at most eight peers")
+            if self.batch_plan is None:
+                self.batch_plan = torch.tensor(
+                    [
+                        (view, peer * self.slot_bytes, self.rank * self.slot_bytes)
+                        for peer, view in sorted(self.peers.items())
+                    ],
+                    dtype=torch.int64,
+                    device="cuda",
+                )
+            send_batch(
+                self.local,
+                from_dlpack(self.batch_plan),
+                self.slot_bytes,
+                self.rank * 8,
+                from_dlpack(self.status),
+                with_signal,
+                self.cu_stream,
+            )
+        else:
             for peer, view in sorted(self.peers.items()):
                 send(
                     self.local,
@@ -166,6 +219,15 @@ class World:
                     with_signal,
                     self.cu_stream,
                 )
+
+    def exchange(self, with_signal=True, *, batched=False):
+        """Send one padded slab per active peer, then wait before reading/reusing it."""
+        self.stream.synchronize()
+        dist.barrier()  # Everyone has consumed the previous contents of recv.
+        self.status.zero_()
+        if self.rank in self.active:
+            self.recv[self.rank].copy_(self.send[self.rank])
+            self.post_sends(with_signal, batched=batched)
             if with_signal:
                 for peer in sorted(self.peers):
                     self.expected[peer] += 1
