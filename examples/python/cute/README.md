@@ -2,6 +2,7 @@
 
 Three operations (`put`, `signal`, `wait`), two runnable examples, one small
 device-bitcode build. This is a source-only prototype, not a production API.
+An optional bounded `put_batch` helper extends the original three calls.
 The MoE example is separate from the binding. See [the walkthrough](walkthrough.html)
 for the incremental tutorial and code map.
 
@@ -66,3 +67,30 @@ are intentionally excluded.
 Validation: all four commands above passed on GB200 (2026-09-17).
 CPU model/build-helper checks: `python -m pytest -q test/python/test_cute_mvp.py`
 (12 passed). These are correctness checks, not performance measurements.
+
+## Optional outgoing peer batch
+
+`--batched` on `put.py` or `moe.py` replaces the outgoing per-peer launches with
+one one-thread kernel. It submits up to eight PUTs before polling any request,
+drains every request (including after an error), then signals only on success.
+The cached plan contains remote views and byte offsets; a membership change
+invalidates it after the normal drain. Defaults and native NIXL APIs are unchanged.
+
+```bash
+torchrun --standalone --nproc-per-node=3 examples/python/cute/moe.py \
+  --batched --membership '0,1;0,1,2;0,2;0,1,2'
+torchrun --standalone --nproc-per-node=4 examples/python/cute/bench_batch.py --bytes 4096
+```
+
+The batch still completes on the GPU before returning. Receive waits, host
+barriers, and reuse rules remain unchanged; this is not a CPU-sync-free exchange.
+CUDA-IPC may complete immediately, so single-node results do not establish an
+asynchronous-network speedup. The small benchmark reports eager **outgoing
+PUT+signal sequence** latency, not full exchange or MoE throughput. It warms both
+paths using precompiled launchers (excluding IR generation and DLPack conversion),
+interleaves serial/batch/batch/serial samples, and excludes a prequeue delay from
+CUDA-event timing. Inspect a trace to rule out host launch starvation.
+
+`test/python/test_cute_batch.py` checks the actual batch body with a fake C++
+backend: synchronous/pending/error results, request alignment, all submissions
+before polling, and draining after an error. It does not emulate UCX ordering.

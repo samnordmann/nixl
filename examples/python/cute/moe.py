@@ -65,7 +65,7 @@ def golden(x, weights, records):
     return output.to(torch.bfloat16)
 
 
-def example(world, membership):
+def example(world, membership, batched=False):
     from common import gather
 
     for generation, active in enumerate(membership_plan(membership, world.size)):
@@ -78,7 +78,7 @@ def example(world, membership):
             for row, (token, _, _) in enumerate(bucket):
                 packed[owner, row] = x[token]
         world.send.copy_(packed)
-        world.exchange()  # Dispatch: recv[source, row, hidden].
+        world.exchange(batched=batched)  # Dispatch: recv[source, row, hidden].
 
         world.send.zero_()
         if world.rank in active:
@@ -89,7 +89,7 @@ def example(world, membership):
                     world.send[source, row] = (
                         world.recv[source, row].float() * (expert + 1)
                     ).to(torch.bfloat16)
-        world.exchange()  # Return expert outputs to their original token owners.
+        world.exchange(batched=batched)  # Return outputs to their original owners.
 
         output = torch.zeros((TOKENS, HIDDEN), dtype=torch.float32, device="cuda")
         for owner, bucket in enumerate(records):
@@ -109,11 +109,12 @@ def example(world, membership):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--membership", default="0,1;0;0,1")
+    parser.add_argument("--batched", action="store_true")
     args = parser.parse_args()
     from common import run
 
     run(
-        lambda world: example(world, args.membership),
+        lambda world: example(world, args.membership, args.batched),
         rows=TOKENS * TOP_K,
         hidden=HIDDEN,
     )

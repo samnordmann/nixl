@@ -15,7 +15,7 @@
 <p class="small">Technical-review MVP · source-only · September 2026</p>
 <h1>NIXL from a CuTe kernel</h1>
 <p>The question is small: <strong>can a CuTe kernel call NIXL's device API, and can we compose those calls into understandable MoE communication?</strong> This prototype answers it with three operations and two programs. It is not a production runtime.</p>
-<nav aria-label="Tutorial"><a href="#design">Design</a><a href="#setup">Build</a><a href="#put">1. PUT</a><a href="#signal">2. Signal</a><a href="#moe">3. MoE</a><a href="#elastic">4. Elasticity</a><a href="#review">Review map</a></nav>
+<nav aria-label="Tutorial"><a href="#design">Design</a><a href="#setup">Build</a><a href="#put">1. PUT</a><a href="#signal">2. Signal</a><a href="#moe">3. MoE</a><a href="#elastic">4. Elasticity</a><a href="#batch">5. Batch</a><a href="#review">Review map</a></nav>
 </header>
 <section id="design">
 <h2>The entire integration</h2>
@@ -86,6 +86,20 @@ commit the new active set; release removed views and metadata
 run the next dispatch / expert / combine round</code></pre>
 <p>All maximum-capacity processes and registered buffers remain alive as standbys. No rank is killed or replaced. The protocol relies on drained phase boundaries, not stale-message recovery, overlapping membership changes, or failure detection. <a href="common.py">World.membership</a> contains the entire control-plane transition.</p>
 <p><strong>Teardown rule:</strong> finish kernels, release every local/remote view, synchronize the owners, then deregister memory. A remote view never grants ownership of another process's storage.</p>
+</section>
+<section id="batch">
+<h2>5. Batch outgoing peers without changing the protocol</h2>
+<p>Add <code>--batched</code> to either example. Instead of one outgoing kernel per peer, one kernel calls the optional <code>put_batch</code> helper with a cached GPU table of remote views and byte offsets. Each request has separate aligned storage that remains alive through completion.</p>
+<pre><code>for peer in outgoing_peers:       # up to eight
+    status[peer] = submit_put(request[peer])
+for peer in outgoing_peers:
+    complete_if_pending(request[peer], status[peer])
+if every_put_succeeded:
+    signal_each_peer()
+# Existing receive waits and host reuse barriers still follow.</code></pre>
+<p>Immediate completion must not poll an uninitialized request. An error must not discard other pending requests. A membership change drains work and invalidates the cached table before old views can be used again. The source and receive buffers keep the same ownership rules as before.</p>
+<p>The <a href="bench_batch.py">small benchmark</a> compares the unchanged serial sender and batched sender with identical PUTs/signals, after warmup, using interleaved samples. It measures only the outgoing sequence. Fewer launches can help small messages; a synchronously completing CUDA-IPC path cannot demonstrate asynchronous network overlap.</p>
+<p class="note">This remains one-thread, one-channel communication. It does not remove CPU barriers, implement device credits, add process admission, or promise that batching wins for every size.</p>
 </section>
 <section id="review">
 <h2>What to review—and what is intentionally absent</h2>

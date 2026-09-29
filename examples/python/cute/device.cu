@@ -61,3 +61,29 @@ cute_nixl_wait(uint64_t address, uint64_t expected) {
     } while (observed < expected);
     return 0;
 }
+
+// Private plan: contiguous rows of {remote view, source offset, destination offset}.
+// Keep every request alive until the batch completes, including after an error.
+extern "C" __device__ __attribute__((always_inline)) int
+cute_nixl_put_batch(uint64_t local, uint64_t plan_address, uint64_t bytes, int count) {
+    constexpr int max_batch = 8;
+    if (count < 0 || count > max_batch) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const auto *plan = reinterpret_cast<const uint64_t *>(plan_address);
+    alignas(64) nixlGpuXferStatusH requests[max_batch];
+    nixl_status_t statuses[max_batch];
+    for (int i = 0; i < count; ++i) {
+        const nixlMemViewElem src{reinterpret_cast<nixlMemViewH>(local), 0, plan[3 * i + 1]};
+        const nixlMemViewElem dst{reinterpret_cast<nixlMemViewH>(plan[3 * i]), 0, plan[3 * i + 2]};
+        statuses[i] = nixlPut(src, dst, bytes, 0, 0, &requests[i]);
+    }
+    int result = NIXL_SUCCESS;
+    for (int i = 0; i < count; ++i) {
+        const int status = complete(requests[i], statuses[i]);
+        if (result == NIXL_SUCCESS && status != NIXL_SUCCESS) {
+            result = status;
+        }
+    }
+    return result;
+}
