@@ -67,7 +67,7 @@ def main():
             "-Wno-unknown-cuda-version",
             "-D_NV_RSQRT_SPECIFIER=",
             "-DNDEBUG",
-            "-O1",
+            "-O3",
             "-emit-llvm",
             "-c",
             *(f"-I{path}" for path in includes),
@@ -79,7 +79,8 @@ def main():
         run(
             "opt",
             "--passes=internalize,inline,globaldce",
-            "-internalize-public-api-list=cute_nixl_put,cute_nixl_signal,cute_nixl_wait",
+            "-internalize-public-api-list=cute_nixl_put,cute_nixl_atomic_add,"
+            "cute_nixl_wait,cute_nixl_progress,cute_nixl_get_ptr,cute_nixl_fence",
             "-S",
             raw,
             "-o",

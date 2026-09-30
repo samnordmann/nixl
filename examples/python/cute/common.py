@@ -77,7 +77,7 @@ def gather(value):
 
 
 class World:
-    def __init__(self, rows, hidden):
+    def __init__(self, rows, hidden, counter_slots=1):
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group("gloo", timeout=timedelta(seconds=120))
         self.rank, self.size = dist.get_rank(), dist.get_world_size()
@@ -87,7 +87,9 @@ class World:
             (self.size, rows, hidden), device="cuda", dtype=torch.bfloat16
         )
         self.recv = torch.zeros_like(self.send)
-        self.ready = torch.zeros(self.size, device="cuda", dtype=torch.int64)
+        self.ready = torch.zeros(
+            self.size * counter_slots, device="cuda", dtype=torch.int64
+        )
         self.status = torch.zeros((self.size, 3), device="cuda", dtype=torch.int32)
         self.stream.synchronize()
         self.agent = nixl_agent(
@@ -113,6 +115,7 @@ class World:
         self.metadata = gather((self.agent.get_agent_metadata(), coords))
         self.local = self.agent.prep_mem_view(self.agent.get_xfer_descs(self.send))
         self.peers, self.active = {}, ()
+        self.generation = 0
         self.expected = [0] * self.size
         self.slot_bytes = rows * hidden * self.send.element_size()
 
@@ -145,6 +148,7 @@ class World:
             self.agent.release_mem_view(staged.pop(peer))
             self.agent.remove_remote_agent(f"cute-{peer}")
         self.peers, self.active = staged, tuple(active)
+        self.generation += 1
         dist.barrier()
 
     def exchange(self, with_signal=True):
@@ -194,10 +198,10 @@ class World:
         dist.destroy_process_group()
 
 
-def run(example, rows, hidden):
+def run(example, rows, hidden, **world_options):
     world = None
     try:
-        world = World(rows, hidden)
+        world = World(rows, hidden, **world_options)
         example(world)
         world.close()
     except BaseException:
