@@ -9,13 +9,42 @@
 <p><a href="benchmark.py">benchmark.py</a> measures a complete padded all-to-all, including self-copy, destination reuse credits, outgoing PUT completion, publication and incoming readiness. CuTe is compared with an <a href="../../../test/python/cute_native_reference.cu">independent NVCC implementation of the same protocol</a> and, optionally, PyTorch/NCCL <code>all_to_all_single</code>. The native comparison isolates integration overhead; NCCL provides another algorithm, not equivalent elastic membership semantics.</p>
 <p>Every implementation uses the same buffers, BF16 payload shape, stream, warmup and graph timing procedure. Inputs are nonuniform; buffers and data are reused intentionally. Two untimed exchanges inside the captured graph absorb host launch skew before CUDA timing events. Three warmup replays precede seven timed replays of 100 exchanges; the result is the median of the slowest-rank time per trial. Setup, compilation and graph capture are excluded. Full per-rank samples are emitted as JSON.</p>
 <h2>Qualified configuration</h2>
-<p>One Lyris node, four NVIDIA GB200 GPUs connected by NVLink. NVIDIA PyTorch 26.06, CUDA 13.3, CUTLASS DSL 4.5.1, LLVM 20, installed UCX 1.21.0. Host NIXL and device bitcode use the same UCX headers. The installed UCX configuration has <code>--without-gda</code>: the qualified transport is CUDA-IPC, not RDMA.</p>
+<p>One Lyris node, four NVIDIA GB200 GPUs connected by NV18 links. NVIDIA driver 580.173.02, PyTorch 26.06 (<code>2.13.0a0+8145d630e8</code>), CUDA 13.3, NCCL 2.30.5, CUTLASS DSL 4.5.1, LLVM 20, UCX 1.21.0 revision <code>65a1a71</code>. Host NIXL and device bitcode use the same UCX headers. The installed UCX configuration has <code>--without-gda</code>: the qualified transport is CUDA-IPC, not RDMA.</p>
+<p class="small">Container: <code>nvcr.io/nvidia/pytorch:26.06-py3@sha256:dcae8df08ef61b019b8eb109113428cba4ef0e37484c6e722406150dd5ada759</code>. Host NIXL was built from MVP base <code>9f91ba2</code>; this follow-up changes no native library/header code.</p>
 <h2>Clean-commit results</h2>
-<p id="source">Results are recorded after the implementation is committed and revalidated from Git.</p>
+<p id="source">Implementation <a href="https://github.com/samnordmann/nixl/commit/55072ff62a882d27e80978aa73e799daeb4e8080"><code>55072ff</code></a>, rebuilt from a clean Git clone. All 15 configurations below passed payload checks for all three implementations: 45 results. Defaults: BLOCK cooperation, 128 threads; tiles are 16 KiB through 64 KiB/peer, 256 KiB for 1–16 MiB/peer, and 1 MiB for 64 MiB/peer.</p>
 <table><thead><tr><th>Ranks / bytes per peer</th><th>CuTe µs</th><th>Native NIXL µs</th><th>NCCL µs</th><th>CuTe outbound GB/s</th></tr></thead><tbody id="measurements">
-<tr><td colspan="5">Clean-commit qualification pending.</td></tr>
+<tr><td>2 / 64 B</td><td>11.81</td><td>11.02</td><td>9.26</td><td>0.0054</td></tr>
+<tr><td>2 / 4 KiB</td><td>11.82</td><td>10.98</td><td>9.71</td><td>0.35</td></tr>
+<tr><td>2 / 64 KiB</td><td>14.58</td><td>13.35</td><td>15.09</td><td>4.5</td></tr>
+<tr><td>2 / 1 MiB</td><td>20.62</td><td>19.16</td><td>17.51</td><td>50.9</td></tr>
+<tr><td>3 / 64 B</td><td>14.92</td><td>13.14</td><td>9.73</td><td>0.0086</td></tr>
+<tr><td>3 / 4 KiB</td><td>14.67</td><td>13.49</td><td>10.28</td><td>0.56</td></tr>
+<tr><td>3 / 64 KiB</td><td>15.15</td><td>14.01</td><td>16.13</td><td>8.7</td></tr>
+<tr><td>3 / 1 MiB</td><td>20.73</td><td>19.28</td><td>20.41</td><td>101.2</td></tr>
+<tr><td>4 / 64 B</td><td>15.12</td><td>13.28</td><td>9.95</td><td>0.0127</td></tr>
+<tr><td>4 / 4 KiB</td><td>14.61</td><td>13.17</td><td>10.57</td><td>0.84</td></tr>
+<tr><td>4 / 64 KiB</td><td>14.88</td><td>13.65</td><td>16.42</td><td>13.2</td></tr>
+<tr><td>4 / 1 MiB</td><td>20.86</td><td>19.32</td><td>22.02</td><td>150.8</td></tr>
+<tr><td>4 / 4 MiB</td><td>34.33</td><td>32.39</td><td>45.48</td><td>366.5</td></tr>
+<tr><td>4 / 16 MiB</td><td>102.83</td><td>102.19</td><td>124.43</td><td>489.5</td></tr>
+<tr><td>4 / 64 MiB</td><td>362.54</td><td>361.68</td><td>419.62</td><td>555.3</td></tr>
 </tbody></table>
 <p>Bandwidth counts only remote outgoing payload bytes per GPU: <code>(ranks−1) × bytes_per_peer / time</code>. It is not bidirectional bandwidth or a claimed percentage of the hardware limit.</p>
+<p>At 64 MiB/peer, CuTe is 0.24% slower than native NIXL and 13.6% lower latency than the tested NCCL path. The seven slowest-rank CuTe samples range from 362.43 to 362.64 µs. At 4 KiB/peer on four ranks, CuTe is instead 38.2% slower than NCCL. At 1 MiB/peer it trails native by 8.0%. These are repeated measurements on one allocation, not confidence intervals across machines or days.</p>
+<h3>Geometry sensitivity, including losing configurations</h3>
+<p>The same clean commit also passed these nine configurations (27 further results). Cooperation is not cosmetic: a one-thread 4 KiB copy is very slow. A warp saves about 0.1–0.2 µs at 64 B but loses at 4 KiB, so the simple BLOCK default remains. For four ranks at 16 MiB/peer, explicitly selecting <code>--tile-bytes 1048576 --threads 512</code> reaches 519.3 GB/s and reduces latency by 5.8%; that geometry regressed 64 MiB/peer in the earlier sweep. Tune the caller's launch geometry, not the API's semantics.</p>
+<table><thead><tr><th>Ranks / bytes per peer</th><th>Level / threads / tile</th><th>CuTe µs</th><th>Native µs</th><th>NCCL µs</th></tr></thead><tbody>
+<tr><td>2 / 64 B</td><td>THREAD / 1 / 16 KiB</td><td>13.17</td><td>12.41</td><td>9.26</td></tr>
+<tr><td>2 / 64 B</td><td>WARP / 32 / 16 KiB</td><td>11.68</td><td>10.87</td><td>9.26</td></tr>
+<tr><td>2 / 4 KiB</td><td>THREAD / 1 / 16 KiB</td><td>116.66</td><td>115.83</td><td>9.66</td></tr>
+<tr><td>2 / 4 KiB</td><td>WARP / 32 / 16 KiB</td><td>13.02</td><td>12.12</td><td>9.26</td></tr>
+<tr><td>4 / 64 B</td><td>THREAD / 1 / 16 KiB</td><td>16.50</td><td>14.59</td><td>9.93</td></tr>
+<tr><td>4 / 64 B</td><td>WARP / 32 / 16 KiB</td><td>14.96</td><td>13.09</td><td>9.91</td></tr>
+<tr><td>4 / 4 KiB</td><td>THREAD / 1 / 16 KiB</td><td>119.06</td><td>117.58</td><td>10.59</td></tr>
+<tr><td>4 / 4 KiB</td><td>WARP / 32 / 16 KiB</td><td>15.78</td><td>14.36</td><td>10.55</td></tr>
+<tr><td>4 / 16 MiB</td><td>BLOCK / 512 / 1 MiB</td><td>96.92</td><td>96.02</td><td>124.34</td></tr>
+</tbody></table>
 <h2>Choices retained and rejected</h2>
 <ul><li>Expose native cooperation levels, descriptor indices, channels, deferred submission and explicit progress/completion. A wrapper must not force every request to complete immediately.</li>
 <li>Use one ready counter and one credit counter per peer, not an atomic for every tile. Kernel completion joins all tile writers before publication.</li>
@@ -23,7 +52,11 @@
 <li>Retain the one-CTA path only for small one-peer exchanges. Multi-peer serial fusion and warp-per-peer experiments did not consistently improve latency and were removed.</li>
 <li>Use a configurable size-dependent tile starting point. Geometry sweeps showed that a single fixed small tile performs poorly on large slabs; this is not a general autotuner.</li></ul>
 <h2>Correctness and limits</h2>
-<p>The checks include changing payloads, partial tiles, THREAD/WARP/BLOCK cooperation, sparse membership, contraction/rejoin, graph replay, stale Python plans, wrong-stream rejection, request state transitions and MoE golden results. The mock backend exercises pending/error transitions in the actual shim, but does not qualify transport ordering.</p>
+<p>13 CPU tests and 11 GPU correctness invocations passed: teaching PUT/signal and MoE, explicit requests, prepared MoE, changing payloads, 65,550-byte partial/misaligned slabs, THREAD/WARP/BLOCK cooperation, sparse membership, contraction/rejoin, graph replay, stale Python plans and wrong-stream rejection. The mock backend exercises pending completion and terminal submission errors in the actual shim, but does not qualify transport ordering.</p>
+<p>Compute Sanitizer device-access checks passed with zero errors for two-rank 4 KiB exchanges, four-rank 65,550-byte exchanges, and the explicit-request example. The initial unfiltered run reported 32 CUDA API diagnostics from <a href="https://github.com/openucx/ucx/blob/65a1a71af27f59e59292c53b90dd446644e6481b/src/uct/cuda/cuda_copy/cuda_copy_md.c#L465-L480">UCX's handled <code>cuMemRetainAllocationHandle</code> VMM probe</a>. The reruns used <code>--report-api-errors no</code>; device and memcpy/memset access checking remained enabled. This is not an unfiltered sanitizer pass.</p>
+<h2>Where the remaining overhead is</h2>
+<p>Nsight Systems 2026.3.1 recorded four-rank, 1 MiB/peer graph execution. Aggregate kernel medians: CuTe/native payload send 8.99/8.96 µs, begin 4.77/3.90 µs, finish/wait 5.02/4.35 µs. The control kernels account for most of the observed integration gap; this is an inference from this trace, not a compiler-level root-cause proof. Those kernels have no reported local-memory use.</p>
+<p>Within the marked measurement ranges, each rank made two graph launches, two event synchronizations and four event queries. There were no allocation, stream-synchronize or per-exchange host-launch calls there. Event synchronization and Gloo barriers occur <em>between trials</em>, outside the timed GPU interval; the prepared exchange itself does not synchronize the CPU. GPU credit waits remain necessary to prevent overwriting unconsumed data.</p>
 <div class="note">Small-message latency can still trail native NIXL and NCCL. Native parity at bandwidth-sized messages is not a proof of universal speed of light. True pending RDMA overlap, cross-node publication ordering, late process creation, crash recovery, Hopper and real FFN/MoE throughput are not established by these tests.</div>
 <p>Elasticity here means graceful changes among registered standby processes, with stable IDs and per-epoch peer views. The binding adds no communicator requirement, but the teaching control plane still uses a fixed Gloo world. Routing/padding and multiplication experts are not production MoE kernels.</p>
 <h2>Reproduce</h2>
