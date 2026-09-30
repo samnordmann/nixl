@@ -14,16 +14,16 @@
 <header>
 <p class="small">Technical-review MVP · source-only · September 2026</p>
 <h1>NIXL from a CuTe kernel</h1>
-<p>The question is small: <strong>can a CuTe kernel call NIXL's device API, and can we compose those calls into understandable MoE communication?</strong> This prototype answers it with three operations and two programs. It is not a production runtime.</p>
+<p>The question is small: <strong>can a CuTe kernel call NIXL's device API, and can we compose those calls into understandable MoE communication?</strong> Start with the original three-operation tutorial, then read the <a href="#prepared">prepared asynchronous path</a>. This remains a review prototype, not a production runtime.</p>
 <nav aria-label="Tutorial"><a href="#design">Design</a><a href="#setup">Build</a><a href="#put">1. PUT</a><a href="#signal">2. Signal</a><a href="#moe">3. MoE</a><a href="#elastic">4. Elasticity</a><a href="#review">Review map</a></nav>
 </header>
 <section id="design">
 <h2>The entire integration</h2>
-<div class="flow" aria-label="Device call chain"><span>CuTe kernel</span>→<span>three private wrappers</span>→<span>NIXL device API</span>→<span>UCX</span></div>
+<div class="flow" aria-label="Device call chain"><span>CuTe kernel</span>→<span>private linking shims</span>→<span>NIXL device API</span>→<span>UCX</span></div>
 <p><a href="nixl_cute.py">nixl_cute.py</a> declares CuTe external functions. <a href="device.cu">device.cu</a> implements them with <code>nixlPut</code>, <code>nixlAtomicAdd</code>, and a system-acquire counter load. <a href="build.py">build.py</a> compiles that small translation unit into LLVM bitcode, which CuTe links into the kernel.</p>
 <p>We still need matching function signatures for the compiler. We do <em>not</em> promise a stable ABI: there is no ABI version, compatibility matrix, manifest, wheel integration, or automatic artifact selection. Rebuild the shims together with NIXL and UCX.</p>
 <p>Host setup uses NIXL's existing <code>register_memory</code>, <code>get_xfer_descs</code>, <code>get_remote_descs</code>, and <code>prep_mem_view</code>. Their opaque integer handles become <code>Uint64</code> kernel arguments. No new owning-handle class is introduced. The application explicitly keeps the original resources alive.</p>
-<p class="note">This example uses one GPU thread per device call. It establishes the integration and ordering model, not a throughput target. An optimized warp/persistent implementation is a later, separate review.</p>
+<p class="note">Tutorials 1–4 retain the original one-thread, synchronous teaching harness. Section 5 adds cooperative calls, explicit request progress, GPU credits and graph replay. See <a href="performance.html">the measurements</a>; these are different execution paths.</p>
 </section>
 <section id="setup">
 <h2>Before running</h2>
@@ -56,7 +56,7 @@ if rc == 0:
 # Receiver, before reading the payload:
 ops.wait(local_counter_address + source_rank * 8, expected_count)</code></pre>
 <p>A system release fence precedes the counter increment; the receiver polls with a system-acquire load. The counter is therefore a publication boundary, not just an integer that happens to change. Expected counts increase across exchanges and membership changes; they are not reset on rejoin.</p>
-<p class="note">A ready signal is not a reuse credit. This MVP uses coarse stream drains and all-rank barriers to ensure old receive contents are consumed before the next exchange overwrites them. It intentionally does not implement a GPU credit scheduler.</p>
+<p class="note">A ready signal is not a reuse credit. This introductory path uses coarse stream drains and all-rank barriers. The prepared path below instead returns credits on the GPU after consumers finish.</p>
 </section>
 <section id="moe">
 <h2>3. Compose a complete MoE communication round</h2>
@@ -96,7 +96,44 @@ run the next dispatch / expert / combine round</code></pre>
 <tr><td><a href="build.py">build.py</a></td><td>Can the small linking shim be built with the selected CUDA/UCX/CuTe toolchain?</td></tr>
 <tr><td><a href="../../../test/python/test_cute_mvp.py">CPU tests</a></td><td>Do sparse routing, stable IDs, weighted combine, and IR cleanup match the model?</td></tr>
 </tbody></table>
-<p>No stable ABI, wheel changes, ownership framework, persistent scheduler, generic topology framework, benchmark suite, process replacement, crash recovery, or CUDA graph replay. Those are separate proposals, not prerequisites for reviewing these three calls.</p>
+<p>No stable ABI, wheel changes, ownership framework, persistent scheduler, generic topology framework, process replacement or crash recovery. Graph replay and a focused benchmark are provided for the prepared path below.</p>
 <p class="small">Source references: the linked files are authoritative for this prototype. For the compiler mechanism, see the official <a href="https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute.html#cutlass.cute.extern">CuTe extern</a> and <a href="https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute.html#cutlass.cute.BitCode">BitCode</a> documentation. The existing native <a href="../../device/ep/tests/elastic/elastic.py">NIXL EP elastic example</a> is the broader reference; this MVP implements only graceful standby membership.</p>
+</section>
+<section id="prepared">
+<h2>5. Submit explicitly; keep the steady state on the GPU</h2>
+<p><a href="async_put.py">async_put.py</a> exposes NIXL's submission/completion distinction, descriptor indices, channel and deferred flag. A cooperative call is executed uniformly by every participating lane; each owns private request storage until completion. Immediate success and error bypass polling.</p>
+<pre><code># Inside a cooperative CuTe kernel (pseudocode):
+request = private_aligned_request_for_this_thread
+rc = ops.put_async(local, remote, bytes, request,
+                   local_index=1, remote_index=1, channel=2,
+                   flags=ops.DEFER, level=ops.BLOCK)
+independent_compute()          # must not touch transfer buffers/request
+rc = ops.complete(request, rc, level=ops.BLOCK)
+ops.fence()                    # EVERY writer publishes its stores
+group_barrier()
+if leader and rc == SUCCESS:
+    ops.atomic_add(1, remote, counter_offset)</code></pre>
+<p><code>DEFER</code> is permission for the backend to defer, not a guarantee of overlap. CUDA-IPC completes the copy during submission on the tested stack. A system fence does not flush an unfinished network transfer. <a href="../../../src/api/device/gpu/nixl_device.cuh">Native NIXL signatures</a> remain authoritative.</p>
+<h3>6. Return credits after consuming, not merely after receiving</h3>
+<p><a href="exchange.py">Exchange</a> allocates and compiles once per membership epoch. Every rank owns two counters per potential peer: incoming readiness and incoming receive credits. Sequence numbers live on the GPU, so graph replays advance them without CPU updates.</p>
+<div class="flow"><span>prior consumers finish</span>→<span>return / await credits</span>→<span>parallel tiled PUTs</span>→<span>publish / await readiness</span>→<span>next consumers</span></div>
+<pre><code>cold epoch:
+    drain all old work; install peer views; reset counters; compile launchers
+
+GPU begin kernel:
+    if previous_step &gt; 0: return credits to every source
+    wait until every destination has consumed my previous output
+GPU send kernel:
+    each CTA cooperatively copies one tile to one peer
+    every writer system-release-fences
+GPU finish kernel:             # all send CTAs have now completed
+    increment one ready counter per peer
+    system-acquire every incoming ready counter
+consume(receive_buffer)        # same stream, no CPU synchronization</code></pre>
+<p>The separate kernels are intentional: kernel completion provides the grid-wide join. No waiting CTA can prevent an unscheduled credit-producing CTA from running. A small one-peer exchange fuses the protocol into one CTA, where this scheduling hazard does not arise. Credits cover whole slabs, avoiding an atomic per tile.</p>
+<h3>7. Prepared MoE, and the limits of the claim</h3>
+<p><a href="moe_stream.py">moe_stream.py</a> prepares routing indices once per epoch and preallocates all application GPU buffers. Forward execution performs GPU pack → dispatch → multiplication experts → return → weighted combine. Its graph test changes the input on each replay, then compares against the original CPU golden model. This removes host synchronization from the steady state; it does not make padding, CPU routing or stand-in experts optimal.</p>
+<p>At a membership boundary: stop graph replays, drain, discard old graphs, update native peer views, and rebuild the prepared plan. Python launchers reject stale epochs and wrong streams; raw graph replay cannot consult those guards. Sparse IDs and graceful shrink/rejoin are covered. Standby processes remain alive: actual late process creation and failure recovery are not implemented.</p>
+<p>Run commands and lifetime contracts are in the <a href="README.md">README</a>. Review the <a href="../../../test/python/cute_exchange_smoke.py">changing-payload/epoch checks</a>, <a href="../../../test/python/test_cute_device_contract.py">mock request-state test</a>, <a href="benchmark.py">benchmark</a>, and <a href="../../../test/python/cute_native_reference.cu">independent native reference</a> separately from the binding.</p>
 </section>
 </main></body></html>

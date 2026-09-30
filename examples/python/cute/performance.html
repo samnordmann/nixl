@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NIXL × CuTe: performance evidence</title>
+<style>body{max-width:1050px;margin:40px auto;padding:0 24px;font:17px/1.6 system-ui;color:#203142;background:#fafcfe}h1,h2{line-height:1.2}a{color:#075e85}table{border-collapse:collapse;width:100%;font-size:15px}th,td{padding:8px;border-bottom:1px solid #d6e0e8;text-align:right}th:first-child,td:first-child{text-align:left}pre{overflow:auto;background:#edf3f7;padding:18px;font-size:13px}.note{border-left:4px solid #075e85;padding:12px 20px;background:#edf3f7}code{font-family:ui-monospace,monospace}</style>
+</head><body>
+<h1>Performance evidence, not a speed-of-light assertion</h1>
+<p>September 30, 2026. This follow-up replaces one-thread copying and host-synchronized steady-state exchanges with cooperative NIXL calls and GPU receive credits. The <a href="walkthrough.html#prepared">design walkthrough</a> explains the ordering/lifetime contract; the <a href="README.md">README</a> contains commands.</p>
+<h2>What is compared</h2>
+<p><a href="benchmark.py">benchmark.py</a> measures a complete padded all-to-all, including self-copy, destination reuse credits, outgoing PUT completion, publication and incoming readiness. CuTe is compared with an <a href="../../../test/python/cute_native_reference.cu">independent NVCC implementation of the same protocol</a> and, optionally, PyTorch/NCCL <code>all_to_all_single</code>. The native comparison isolates integration overhead; NCCL provides another algorithm, not equivalent elastic membership semantics.</p>
+<p>Every implementation uses the same buffers, BF16 payload shape, stream, warmup and graph timing procedure. Inputs are nonuniform; buffers and data are reused intentionally. Two untimed exchanges inside the captured graph absorb host launch skew before CUDA timing events. Three warmup replays precede seven timed replays of 100 exchanges; the result is the median of the slowest-rank time per trial. Setup, compilation and graph capture are excluded. Full per-rank samples are emitted as JSON.</p>
+<h2>Qualified configuration</h2>
+<p>One Lyris node, four NVIDIA GB200 GPUs connected by NVLink. NVIDIA PyTorch 26.06, CUDA 13.3, CUTLASS DSL 4.5.1, LLVM 20, installed UCX 1.21.0. Host NIXL and device bitcode use the same UCX headers. The installed UCX configuration has <code>--without-gda</code>: the qualified transport is CUDA-IPC, not RDMA.</p>
+<h2>Clean-commit results</h2>
+<p id="source">Results are recorded after the implementation is committed and revalidated from Git.</p>
+<table><thead><tr><th>Ranks / bytes per peer</th><th>CuTe µs</th><th>Native NIXL µs</th><th>NCCL µs</th><th>CuTe outbound GB/s</th></tr></thead><tbody id="measurements">
+<tr><td colspan="5">Clean-commit qualification pending.</td></tr>
+</tbody></table>
+<p>Bandwidth counts only remote outgoing payload bytes per GPU: <code>(ranks−1) × bytes_per_peer / time</code>. It is not bidirectional bandwidth or a claimed percentage of the hardware limit.</p>
+<h2>Choices retained and rejected</h2>
+<ul><li>Expose native cooperation levels, descriptor indices, channels, deferred submission and explicit progress/completion. A wrapper must not force every request to complete immediately.</li>
+<li>Use one ready counter and one credit counter per peer, not an atomic for every tile. Kernel completion joins all tile writers before publication.</li>
+<li>Precompile launchers, preallocate application buffers, and advance sequence numbers on the GPU. There are no CPU barriers or status readbacks inside a prepared forward call.</li>
+<li>Retain the one-CTA path only for small one-peer exchanges. Multi-peer serial fusion and warp-per-peer experiments did not consistently improve latency and were removed.</li>
+<li>Use a configurable size-dependent tile starting point. Geometry sweeps showed that a single fixed small tile performs poorly on large slabs; this is not a general autotuner.</li></ul>
+<h2>Correctness and limits</h2>
+<p>The checks include changing payloads, partial tiles, THREAD/WARP/BLOCK cooperation, sparse membership, contraction/rejoin, graph replay, stale Python plans, wrong-stream rejection, request state transitions and MoE golden results. The mock backend exercises pending/error transitions in the actual shim, but does not qualify transport ordering.</p>
+<div class="note">Small-message latency can still trail native NIXL and NCCL. Native parity at bandwidth-sized messages is not a proof of universal speed of light. True pending RDMA overlap, cross-node publication ordering, late process creation, crash recovery, Hopper and real FFN/MoE throughput are not established by these tests.</div>
+<p>Elasticity here means graceful changes among registered standby processes, with stable IDs and per-epoch peer views. The binding adds no communicator requirement, but the teaching control plane still uses a fixed Gloo world. Routing/padding and multiplication experts are not production MoE kernels.</p>
+<h2>Reproduce</h2>
+<pre><code>nvcc -std=c++17 -O3 -DNDEBUG -arch=sm_100 -shared -Xcompiler -fPIC \
+  -I src/api/device -I src/api/cpp -I /opt/hpcx/ucx/include \
+  test/python/cute_native_reference.cu -o /tmp/cute_native_reference.so
+timeout 180s torchrun --standalone --nproc-per-node=4 \
+  examples/python/cute/benchmark.py --bytes 67108864 \
+  --reference-so /tmp/cute_native_reference.so --nccl</code></pre>
+<p>Use <code>--tile-bytes</code>, <code>--threads</code> and <code>--level</code> to sweep geometry. Use an external timeout: this prototype deliberately has no device-wait failure recovery. Compare only runs with matching topology, compiler, backend and graph settings.</p>
+</body></html>
