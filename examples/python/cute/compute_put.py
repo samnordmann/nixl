@@ -173,17 +173,19 @@ def main():
         agent.get_remote_descs(metadata[peer][1], mem_type="VRAM")
     )
     tensors = tuple(map(from_dlpack, (src, ready, recv, observed, requests, status)))
+    cu_stream = cuda.CUstream(stream.cuda_stream)
     tail = (
         rank,
         threads,
         level,
         device.DEFER if args.defer else 0,
-        cuda.CUstream(stream.cuda_stream),
+        cu_stream,
     )
     compiled = cute.compile(launch, *tensors, local, remote, cutlass.Int64(1), *tail)
     dist.barrier()
     for sequence in range(1, 4):
-        compiled(*tensors, local, remote, cutlass.Int64(sequence), *tail)
+        # Constexpr launch parameters were consumed by cute.compile.
+        compiled(*tensors, local, remote, cutlass.Int64(sequence), cu_stream)
         # Validation/reuse boundary only; no CPU involvement inside the kernel.
         stream.synchronize()
         assert status.count_nonzero().item() == 0, status.cpu().tolist()

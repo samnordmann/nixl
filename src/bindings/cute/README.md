@@ -84,7 +84,8 @@ and CPU validation/reuse barriers are deliberately visible. Gloo is only the
 two-rank test bootstrap, not a requirement of NIXL's peer model. This is a
 correctness example, **not a speed-of-light benchmark or a KV-cache codec**.
 
-With a Meson build configured using `-Dbuild_tests=true`:
+With GTest/GMock installed and a Meson build configured using
+`-Dbuild_tests=true -Dbuildtype=debugoptimized` (upstream excludes tests in release):
 
 ```sh
 meson compile -C build cute_device_binding
