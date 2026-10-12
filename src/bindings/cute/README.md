@@ -32,9 +32,10 @@ See the [native contract](../../api/device/gpu/nixl_device.cuh).
 - Each participating thread supplies its own zero-initialized, 64-byte request,
   aligned to 16 bytes. Reuse it only after completion, with the same cooperation
   level. Buffers and views must remain valid while operations are outstanding.
-- Submission does **not** wait. On `IN_PROGRESS`, progress the request until
-  success/error; do not poll a terminal request. The pinned UCX backend reports
-  accepted submissions as `IN_PROGRESS`, even when UCX initially returns OK.
+- The binding adds **no completion wait**; native submission may do inline work.
+  On `IN_PROGRESS`, progress the request until success/error; do not poll a
+  terminal request. The pinned UCX backend reports accepted submissions as
+  `IN_PROGRESS`, even when UCX initially returns OK.
 - `request=0` passes the native null pointer; it does **not** select blocking
   mode. There is no pollable request in that case. The application must establish
   completion/lifetime by its native protocol; the example always tracks requests.
